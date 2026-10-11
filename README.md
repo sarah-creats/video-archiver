@@ -37,8 +37,8 @@
 - [Third-party components](#third-party-components)
 - [License](#license)
 
-<!-- Screenshot: upload a picture of the app as docs/screenshot.png, then remove this line and the one below.
-<p align="center"><img src="docs/screenshot.png" alt="Video Archiver window" width="640"></p>
+
+<p align="center"><img src="docs/Archiver-screenshot.png" alt="Video Archiver window" width="640"></p>
 -->
 
 ## Features
