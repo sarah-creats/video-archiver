@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.0
+
+- New: **Capture a video's stream address** from a separate browser window (Edge, Chrome
+  or Brave, fresh throwaway profile). Works on sites that refuse to play while DevTools
+  are open, because DevTools stay closed; addresses come from the browser's own network log.
+- New: the site wizard, and the plugins it builds, also look inside the player's own page
+  (iframes, two levels deep) and the site's script files, and send the player's Referer.
+- The site wizard has a "Capture from a browser window" button that fills in the stream
+  address for you.
+- Fixed: site links with a port number (`site.tv:8080/...`) now work in the site wizard.
+
 ## 1.0.0
 
 First public version.

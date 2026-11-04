@@ -37,8 +37,8 @@
 - [Third-party components](#third-party-components)
 - [License](#license)
 
-
-<p align="center"><img src="docs/Archiver-screenshot.png" alt="Video Archiver window" width="640"></p>
+<!-- Screenshot: upload a picture of the app as docs/screenshot.png, then remove this line and the one below.
+<p align="center"><img src="docs/screenshot.png" alt="Video Archiver window" width="640"></p>
 -->
 
 ## Features
@@ -62,7 +62,11 @@
 
 **For tricky sites**
 - **Teach a new site:** give it a link to one video and it builds and tests a
-  yt-dlp plugin for that site. No programming needed.
+  yt-dlp plugin for that site. No programming needed. It reads the page, the
+  player's own page (iframes) and the site's scripts.
+- **Capture from a browser window:** plays the video in a separate, clean browser
+  window and picks up the address the browser loads. Works even on sites that stop
+  playing when DevTools are open, because DevTools stay closed.
 - Stream links (`.m3u8` / `.mpd`) for sites nothing else understands.
 - Cookies from Firefox or from a `cookies.txt` file, for videos that need you to be signed in.
 - One-click helper for YouTube "HTTP Error 403: Forbidden" (PO tokens).
@@ -133,7 +137,8 @@ Each video becomes its own item at `archive.org/details/<your-prefix>-<video id>
 |---|---|
 | **Step 4 > Upload files…** | Finds videos you downloaded earlier and uploads the ones missing on archive.org, for example after an upload failed. |
 | **Tools > Teach Video Archiver a new site…** | Builds a yt-dlp plugin for a site that isn't supported, from one example link. |
-| **Tools > Add a stream link…** | Downloads a video from its `.m3u8`/`.mpd` address (found with F12 > Network). |
+| **Tools > Capture a video's stream address…** | Opens the video in a separate browser window; you play it, and the app picks up its address. |
+| **Tools > Add a stream link…** | Downloads a video from its `.m3u8`/`.mpd` address. |
 | **Tools > Check a site or link…** | Tests whether a link works right now and explains why not. |
 | **Tools > Fix YouTube "403 Forbidden"…** | Installs the PO-token helper yt-dlp recommends. |
 | **Options > Cookies** | Use your Firefox sign-in or a `cookies.txt` export for sign-in-only videos. |
@@ -182,8 +187,13 @@ it's usually antivirus "HTTPS scanning" or a school/work network filter.
 <summary><b>A site isn't supported</b></summary>
 
 Try **Tools > Check a site or link**, then **Tools > yt-dlp channel > Nightly**, then
-**Tools > Teach Video Archiver a new site**. As a last resort, find the stream
-address with F12 > Network and use **Tools > Add a stream link**.
+**Tools > Teach Video Archiver a new site**. If the site only creates the address
+while the video plays, press **Capture from a browser window** in that wizard (or use
+**Tools > Capture a video's stream address** for a single video). This also works on
+sites that refuse to play while DevTools are open.
+
+DRM-protected video (the kind big paid streaming services use) can't be downloaded,
+and the app doesn't try to get around that.
 </details>
 
 <details>

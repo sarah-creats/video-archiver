@@ -483,6 +483,69 @@ def pick(streams, site):
     return sorted(enumerate(streams), key=key)[0][1]
 
 
+_KNOWN_EMBED_RE = _re.compile(r"(?i)youtube(?:-nocookie)?\.com/embed/|player\.vimeo\.com/video/|dailymotion\.com/embed/|"
+                              r"rumble\.com/embed/|odysee\.com/\$/embed/|streamable\.com/[eo]/|bitchute\.com/embed/|"
+                              r"player\.twitch\.tv|facebook\.com/plugins/video|ok\.ru/videoembed|vk\.com/video_ext")
+_IFRAME_RE = _re.compile(r'''<iframe\b[^>]*?\b(?:data-)?src\s*=\s*["']([^"']+)["']''', _re.I)
+_SCRIPT_SRC_RE = _re.compile(r'''<script\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']''', _re.I)
+_NOT_PLAYER_RE = _re.compile(r"(?i)googletagmanager|google-analytics|gtag|doubleclick|googlesyndication|adsbygoogle|"
+                             r"recaptcha|hcaptcha|cdn-cgi|cookie|consent|analytics|facebook\.net|jquery|bootstrap|"
+                             r"fontawesome|polyfill|/ads?[/.]|advert|disqus|twitter\.com/widgets")
+_PLAYER_HINT_RE = _re.compile(r"(?i)player|video|embed|stream|media|hls|dash|jw|vjs|plyr|clappr|watch|config|app|main")
+
+
+def _site_of(u):
+    host = (_urlparse(u).hostname or "").lower()
+    return ".".join(host.split(".")[-2:])
+
+
+def deep_sources(webpage, page_url, site):
+    # Other files that may hold the address: the player's own page (an iframe) and
+    # the site's script files. [(url, "frame" or "script")], most promising first.
+    out, seen = [], {page_url}
+
+    def add(u, kind):
+        if u.startswith("http") and u not in seen and not _NOT_PLAYER_RE.search(u) and not _JUNK_RE.search(u):
+            seen.add(u)
+            out.append((u, kind))
+    for m in _IFRAME_RE.finditer(webpage):
+        u = _clean(m.group(1), page_url)
+        if not _KNOWN_EMBED_RE.search(u):
+            add(u, "frame")
+    for m in _SCRIPT_SRC_RE.finditer(webpage):
+        u = _clean(m.group(1), page_url)
+        if _site_of(u) == _site_of(page_url) or _PLAYER_HINT_RE.search(_urlparse(u).path):
+            add(u, "script")
+    return out[:int(site.get("deep_limit", 12))]
+
+
+def choose_deep(webpage, page_url, video_id, site, fetch):
+    # Like choose(), but if the page itself has no address, also look inside the
+    # player's own page (one more level of player page too) and the site's scripts.
+    # fetch(url, referer) -> text or None. Returns (kind, target, referer).
+    kind, target = choose(webpage, page_url, video_id, site)
+    if kind == "stream" or not site.get("deep", True):
+        return kind, target, page_url
+    if kind == "embed" and _KNOWN_EMBED_RE.search(target):
+        return kind, target, page_url
+    for u, src_kind in deep_sources(webpage, page_url, site):
+        text = fetch(u, page_url)
+        if not text:
+            continue
+        streams = find_streams(text, u)
+        if streams:
+            return "stream", pick(streams, site), (u if src_kind == "frame" else page_url)
+        if src_kind == "frame":      # page > player host > the actual player
+            for u2, kind2 in deep_sources(text, u, {"deep_limit": 4}):
+                if kind2 != "frame":
+                    continue
+                text2 = fetch(u2, u)
+                streams = find_streams(text2 or "", u2)
+                if streams:
+                    return "stream", pick(streams, site), u2
+    return kind, target, page_url
+
+
 def choose(webpage, page_url, video_id, site):
     # 1) an address rebuilt from the video's id or a value on the page
     if site.get("template"):
@@ -516,13 +579,17 @@ class @@CLASS@@(InfoExtractor):
     def _real_extract(self, url):
         video_id = self._match_id(url)
         webpage = self._download_webpage(url, video_id)
-        kind, target = choose(webpage, url, video_id, SITE)
+        def fetch(page, referer):
+            text = self._download_webpage(page, video_id, note="Looking inside the player", errnote=False,
+                                          fatal=False, headers={"Referer": referer})
+            return text if isinstance(text, str) else None
+        kind, target, referer = choose_deep(webpage, url, video_id, SITE, fetch)
         if kind == "embed":
             return self.url_result(target)
         if not target:
             self.raise_no_formats("No video address found on this page. Run Video Archiver's "
                                   "Tools > Teach Video Archiver a new site again with this link.", expected=True)
-        headers = {"Referer": url}
+        headers = {"Referer": referer}
         ext = stream_ext(target)
         if ext == "m3u8":
             formats = self._extract_m3u8_formats(target, video_id, "mp4", m3u8_id="hls", headers=headers)
@@ -559,11 +626,14 @@ BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/131.0 Safari/537.36")
 
 
-def fetch_page(url):
+def fetch_page(url, referer=None):
     """(html, final address) of a web page, fetched like a browser would."""
     import gzip
-    req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA, "Accept-Language": "en,de;q=0.8",
-                                               "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"})
+    headers = {"User-Agent": BROWSER_UA, "Accept-Language": "en,de;q=0.8",
+               "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"}
+    if referer:
+        headers["Referer"] = referer
+    req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             data = r.read(5_000_000)
@@ -589,7 +659,7 @@ def _site_base(url):
 def guess_pattern(url):
     """'https://www.site.de/video/123/my-title' -> 'site.de/video/*/*' (* = changes per video)."""
     p = urllib.parse.urlsplit(url.strip())
-    host = re.sub(r"^www\.", "", (p.hostname or "").lower())
+    host = re.sub(r"^www\.", "", p.netloc.rsplit("@", 1)[-1].lower())   # keeps a :port, drops user:pass@
     segs = [x for x in p.path.split("/") if x]
     generic = {"watch", "video", "videos", "play", "view", "player", "embed", "v", "media",
                "index.php", "watch.php", "video.php", "view.php", "play.php"}
@@ -674,7 +744,19 @@ def analyze_site(link, link2="", stream="", fetch=fetch_page):
         return res
     res["pattern"] = pattern = guess_pattern(link)
     page_id = re.match(wildcard_to_regex(pattern, link), link, re.I).group("id")
-    site = {"prefer_host": None, "prefer_ext": None, "template": None, "value_regex": None, "embeds": True}
+    site = {"prefer_host": None, "prefer_ext": None, "template": None, "value_regex": None, "embeds": True,
+            "deep": True}
+
+    def deep_fetch(url, referer):
+        try:
+            return fetch(url, referer=referer)[0]
+        except (PageError, OSError, ValueError):
+            return None
+
+    def where(ref, target):
+        if ref != link:
+            return f"inside the player page on {urllib.parse.urlsplit(ref).hostname}"
+        return "in one of the site's script files"
     title = core["page_title"](webpage, page_id)
     say(f"Page: {title}")
 
@@ -684,15 +766,24 @@ def analyze_site(link, link2="", stream="", fetch=fetch_page):
             return res
         streams = core["find_streams"](webpage, link)
         same = [u for u in streams if u.split("?")[0] == stream.split("?")[0]]
-        if same:
+        deep_hit = None
+        if not same:
+            probe = dict(site, prefer_host=urllib.parse.urlsplit(stream).hostname,
+                         prefer_ext=core["stream_ext"](stream) or None)
+            kind, target, ref = core["choose_deep"](webpage, link, page_id, probe, deep_fetch)
+            if kind == "stream" and target and target.split("?")[0] == stream.split("?")[0]:
+                deep_hit = ref
+        if same or deep_hit:
             site.update(prefer_host=urllib.parse.urlsplit(stream).hostname,
                         prefer_ext=core["stream_ext"](stream) or None)
-            say("Found your stream address written in the page, so other videos' pages will have theirs too.")
+            say("Found your stream address " + ("written in the page" if same else where(deep_hit, stream))
+                + ", so other videos will have theirs there too.")
         else:
             learned = learn_template(webpage, page_id, stream)
             if not learned:
-                say("Your stream address isn't in the page and isn't built from anything on it. The site "
-                    "probably asks its server for it with JavaScript, so a plugin can't find it for other videos.")
+                say("Your stream address isn't in the page, the player page or the site's scripts, and isn't "
+                    "built from anything on the page. The site asks its server for it while the video plays, "
+                    "so a plugin can't find it for other videos.")
                 say("You can still download this one video: press \"Use as stream link\".")
                 res["stream_line"] = f"{stream} | referer={link}"
                 return res
@@ -714,23 +805,26 @@ def analyze_site(link, link2="", stream="", fetch=fetch_page):
                 core["stream_ext"](chosen), "a video file")
             say(f"Found {kind} on {site['prefer_host']} in the page"
                 + (f" ({len(streams)} addresses in total; using the best one)." if len(streams) > 1 else "."))
-        elif embeds:
-            host = urllib.parse.urlsplit(embeds[0]).hostname
-            say(f"The video is a player embedded from {host}. The plugin will hand it to yt-dlp's "
-                "support for that site.")
         else:
-            say("I couldn't find the video's address in the page: the site loads it with JavaScript.")
-            say("Please give me the stream address, then press Analyze again:")
-            for i, step in enumerate(("Open the video page in your browser and press F12.",
-                                      "Click the Network tab and type m3u8 into its filter box (if nothing "
-                                      "shows up later, try mpd instead).",
-                                      "Play the video.",
-                                      "Right-click the first line that appears > Copy > Copy URL.",
-                                      "Paste it into \"Stream address\" here."), 1):
-                say(f"  {i}. {step}")
-            return res
+            say("Not in the page itself; looking inside the player page and the site's scripts...")
+            kind, target, ref = core["choose_deep"](webpage, link, page_id, site, deep_fetch)
+            if kind == "stream":
+                site.update(prefer_host=urllib.parse.urlsplit(target).hostname,
+                            prefer_ext=core["stream_ext"](target) or None)
+                say(f"Found it {where(ref, target)}.")
+            elif kind == "embed":
+                host = urllib.parse.urlsplit(target).hostname
+                say(f"The video is a player embedded from {host}. The plugin will hand it to yt-dlp's "
+                    "support for that site.")
+            else:
+                say("The address isn't in the page, the player page or the site's scripts: the site only "
+                    "creates it while the video plays.")
+                say("Press \"Capture from a browser window\": a separate browser window opens, you play the "
+                    "video for a few seconds, and the app picks up the address. (It works even on sites that "
+                    "stop playing when DevTools are open, because DevTools stay closed.)")
+                return res
 
-    kind, target = core["choose"](webpage, link, page_id, site)
+    kind, target, ref = core["choose_deep"](webpage, link, page_id, site, deep_fetch)
     if not target:
         say("Something doesn't add up: the plugin's own test on this page found nothing.")
         return res
@@ -743,7 +837,7 @@ def analyze_site(link, link2="", stream="", fetch=fetch_page):
                 say("Second link: it doesn't fit the pattern below. Change the pattern so both links fit.")
             else:
                 page2, _ = fetch(link2)
-                _, target2 = core["choose"](page2, link2, m.group("id"), site)
+                _, target2, _ = core["choose_deep"](page2, link2, m.group("id"), site, deep_fetch)
                 t2 = core["page_title"](page2, m.group("id"))
                 if target2 and target2 != target:
                     say(f"Second video ({t2}): found its own address too. Good sign.")
@@ -778,6 +872,112 @@ def write_site_plugin(pattern, link, site):
     path = folder / f"yta_{base}.py"
     path.write_text(src, encoding="utf-8")
     return path
+
+
+# --------------------------------------------------------------------------
+# Capture a video's address from a normal browser window. Works on sites that
+# stop playing when DevTools are open: DevTools stay closed, and the addresses
+# come from the browser's own network log (--log-net-log).
+# --------------------------------------------------------------------------
+
+CAPTURE_BROWSERS = (("msedge.exe", r"Microsoft\Edge\Application\msedge.exe"),
+                    ("chrome.exe", r"Google\Chrome\Application\chrome.exe"),
+                    ("brave.exe", r"BraveSoftware\Brave-Browser\Application\brave.exe"))
+SEGMENT_EXTS = ("ts", "m4s", "m4v", "m4f", "cmfv", "cmfa")
+
+
+def find_browser():
+    """Edge, Chrome or Brave (any Chromium browser can write a network log)."""
+    override = os.environ.get("VA_CAPTURE_BROWSER")
+    if override:
+        return Path(override) if Path(override).is_file() else None
+    if sys.platform == "win32":
+        import winreg
+        for exe, rel in CAPTURE_BROWSERS:
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                try:
+                    key = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths" + "\\" + exe
+                    with winreg.OpenKey(hive, key) as k:
+                        path = Path(str(winreg.QueryValue(k, None) or "").strip('"'))
+                    if path.is_file():
+                        return path
+                except OSError:
+                    pass
+            for base in ("ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"):
+                root = os.environ.get(base)
+                if root and (Path(root) / rel).is_file():
+                    return Path(root) / rel
+        return None
+    for name in ("microsoft-edge", "google-chrome", "chromium", "chromium-browser", "chrome"):
+        found = shutil.which(name)
+        if found:
+            return Path(found)
+    return None
+
+
+def parse_netlog(text):
+    """Video addresses the browser loaded, best first, and how many stream pieces
+    (segments) it loaded. The first .m3u8 loaded is normally the main playlist."""
+    core = plugin_core()
+    seen, found, segments = set(), [], 0
+    for raw in re.findall(r'"(https?://[^"\\]*(?:\\.[^"\\]*)*)"', text):
+        try:
+            url = json.loads('"' + raw + '"')
+        except ValueError:
+            url = raw
+        if url in seen:
+            continue
+        seen.add(url)
+        if core["stream_ext"](url):
+            found.append(url)
+        elif urllib.parse.urlsplit(url).path.lower().rsplit(".", 1)[-1] in SEGMENT_EXTS:
+            segments += 1
+    rank = {"m3u8": 0, "mpd": 1, "mp4": 2, "webm": 3, "m4a": 4, "mp3": 5}
+    junk = core["_JUNK_RE"]
+    found.sort(key=lambda u: (bool(junk.search(u)), rank.get(core["stream_ext"](u), 9)))
+    return found, segments
+
+
+class BrowserCapture:
+    """Opens the page in a separate browser window with a fresh, throwaway profile and
+    records which addresses it loads. Nothing of your normal browser is used or changed."""
+
+    def __init__(self, page_url, browser=None):
+        self.page_url = page_url
+        self.browser = browser or find_browser()
+        self.dir = Path(tempfile.mkdtemp(prefix="va-capture-"))
+        self.log = self.dir / "net.json"
+        self.proc = None
+
+    def start(self, extra_args=()):
+        if not self.browser:
+            raise OSError("No Microsoft Edge, Google Chrome or Brave found on this PC.")
+        args = [str(self.browser), f"--user-data-dir={self.dir / 'profile'}", f"--log-net-log={self.log}",
+                "--no-first-run", "--no-default-browser-check", "--disable-sync", *extra_args,
+                "--new-window", self.page_url]
+        self.proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+
+    def finish(self, wait=15):
+        """Close the window (politely first, so the browser finishes its log), then
+        read the log and delete the throwaway profile. Returns (addresses, segments)."""
+        if self.proc and self.proc.poll() is None:
+            try:
+                if sys.platform == "win32":
+                    subprocess.run(["taskkill", "/PID", str(self.proc.pid), "/T"], capture_output=True,
+                                   creationflags=NO_WINDOW)
+                else:
+                    self.proc.terminate()
+                self.proc.wait(wait)
+            except (subprocess.TimeoutExpired, OSError):
+                kill_tree(self.proc)
+        try:
+            text = self.log.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        result = parse_netlog(text)
+        _rmtree_retry(self.dir)
+        return result
 
 
 _extractor_cache = []
@@ -854,7 +1054,9 @@ def check_link(line, cookies=False):
             tips.append("Tools > yt-dlp channel > Nightly: newest fixes and sites, often helps.")
         tips += ["Tools > Teach Video Archiver a new site: give it this link and it builds and tests "
                  "a plugin for the site, no programming needed.",
-                 "Just this one video: F12 > Network, filter 'm3u8' or 'mpd', play the video, right-click "
+                 "Just this one video: Tools > Capture a video's stream address (plays it in a separate "
+                 "browser window and picks up the address; works even where DevTools are blocked). Or "
+                 "by hand: F12 > Network, filter 'm3u8' or 'mpd', play the video, right-click "
                  "the request > Copy URL, then Tools > Add a stream link."]
         report += [f"  {i}. {t}" for i, t in enumerate(tips, 1)]
     if notes:
@@ -4557,14 +4759,16 @@ def run_gui():
         root.wait_window(dlg)
         return result or None
 
-    def add_stream_link():
+    def add_stream_link(url="", page=""):
         got = simple_dialog(
             "Add a stream link", ok_text="Add",
-            intro=("For sites yt-dlp doesn't support: open the video page in your browser, press F12, "
-                   "go to Network, type m3u8 (or mpd) in the filter box and play the video. "
-                   "Right-click the request that appears > Copy > Copy URL, and paste it below."),
-            rows=[("url", "Stream address:", "", "Ends in .m3u8 or .mpd (anything after a ? is fine)."),
-                  ("page", "Page it's on:", "", "Sent along as the Referer; many sites need it."),
+            intro=("Captured from a browser window: check the addresses below and press Add. Download soon: "
+                   "such addresses often stop working after a while." if url else
+                   "For sites yt-dlp doesn't support. Easiest: Tools > Capture a video's stream address. "
+                   "By hand: open the video page, press F12, go to Network, type m3u8 (or mpd) in the filter "
+                   "box and play the video. Right-click the request > Copy > Copy URL, and paste it below."),
+            rows=[("url", "Stream address:", url, "Ends in .m3u8 or .mpd (anything after a ? is fine)."),
+                  ("page", "Page it's on:", page, "Sent along as the Referer; many sites need it."),
                   ("title", "Title:", "", "Optional. Without it, the title comes from the page address.")])
         if not got:
             return
@@ -4579,6 +4783,84 @@ def run_gui():
         current = links.get("1.0", "end").strip()
         links.insert("end", ("\n" if current else "") + line)
         write_log("Stream link added to Step 1.", "ok")
+
+    def capture_stream(link, parent, done):
+        """Open link in a separate browser window, let the user play the video, then call
+        done(addresses, segments) on the main thread. Returns False if it couldn't start."""
+        cap = BrowserCapture(link)
+        try:
+            cap.start()
+        except OSError as exc:
+            messagebox.showinfo("Capture", f"{exc}\n\nInstall Microsoft Edge or Google Chrome and try again.",
+                                parent=parent)
+            return False
+        write_log(f"Capture: opened {link} in a separate {cap.browser.stem} window.")
+        messagebox.showinfo(
+            "Capture the video's address",
+            "A separate browser window has opened with the video page. It's a fresh, empty profile: "
+            "nothing from your normal browser is used, and it's deleted afterwards.\n\n"
+            "1. Play the video there for about 10 seconds (skip or wait out any ads).\n"
+            "2. If the site needs you to sign in, do that in that window first.\n"
+            "3. Then come back and press OK here. The window closes by itself.",
+            parent=parent)
+        result = {}
+
+        def work():
+            try:
+                result["value"] = cap.finish()
+            except Exception as exc:
+                result["error"] = str(exc)
+        threading.Thread(target=work, daemon=True).start()
+
+        def wait():
+            if not result:
+                root.after(150, wait)
+                return
+            if "error" in result:
+                write_log(f"Capture failed: {result['error']}", "err")
+                done([], 0)
+            else:
+                found, segments = result["value"]
+                write_log(f"Capture: found {len(found)} video address(es)"
+                          + (f" and {segments} stream pieces." if segments else "."), "ok" if found else "warn")
+                done(found, segments)
+        wait()
+        return True
+
+    def capture_hint(found, segments):
+        if found:
+            return None
+        if segments:
+            return ("The browser loaded pieces of a stream but no playlist (.m3u8/.mpd) address. The site may "
+                    "build the playlist inside the player, or protect it with DRM; this one can't be captured.")
+        return ("The browser loaded no video address. Did the video actually play in that window? Try again "
+                "and let it play for longer. If it plays but nothing is found, the video may be DRM-protected, "
+                "which this app doesn't download.")
+
+    def capture_tool():
+        got = simple_dialog(
+            "Capture a video's stream address", ok_text="Open",
+            intro=("Opens the video page in a separate browser window. You play the video, and the app picks "
+                   "up the address the browser loads. It works even on sites that stop playing when DevTools "
+                   "are open, because DevTools stay closed. DRM-protected video can't be downloaded."),
+            rows=[("page", "Video page:", parse_link_line(links.get("1.0", "end").strip().split("\n")[0])[0]
+                   if links.get("1.0", "end").strip() else "", None)])
+        if not got:
+            return
+        page = got["page"]
+        if not re.match(r"https?://\S+$", page):
+            messagebox.showinfo("Capture", "Paste the full link of the video page (starting with https://).")
+            return
+
+        def done(found, segments):
+            hint = capture_hint(found, segments)
+            if hint:
+                messagebox.showinfo("Capture", hint)
+                return
+            if len(found) > 1:
+                write_log("   Other addresses it loaded: " + ", ".join(u[:80] for u in found[1:5]))
+            add_stream_link(url=found[0], page=page)
+        capture_stream(page, root, done)
 
     def teach_site_dialog():
         """Wizard: give it a video link, it works out the rest and builds a tested plugin."""
@@ -4601,7 +4883,8 @@ def run_gui():
         rows = [(link_var, "Video link:", None),
                 (link2_var, "Another video:", "Optional, but recommended: a second video from the same site, "
                                               "to check it works for more than one."),
-                (stream_var, "Stream address:", "Leave empty. Only needed if I ask for it below.")]
+                (stream_var, "Stream address:", "Leave empty. Only needed if I ask for it below; \"Capture "
+                                                "from a browser window\" fills it in for you.")]
         r = 1
         for var, text, hint in rows:
             label(frm, text).grid(row=r, column=0, sticky="w", pady=px(2))
@@ -4749,8 +5032,35 @@ def run_gui():
             root.clipboard_clear()
             root.clipboard_append(state_["log"] or out.get("1.0", "end"))
 
+        def do_capture():
+            link = link_var.get().strip()
+            if not re.match(r"https?://\S+$", link):
+                show("Paste the link of one video page first.")
+                return
+            show("A separate browser window is opening. Play the video there, then press OK in the "
+                 "message that appears.\n")
+            cap_b.configure(state="disabled")
+
+            def done(found, segments):
+                if not dlg.winfo_exists():
+                    return
+                cap_b.configure(state="normal")
+                hint = capture_hint(found, segments)
+                if hint:
+                    show(hint)
+                    return
+                stream_var.set(found[0])
+                show("Captured the video's address:\n  " + found[0][:160] + "\n"
+                     + ("".join("  (also loaded: " + u[:100] + ")\n" for u in found[1:4]))
+                     + "\nAnalyzing with it...\n")
+                dlg.after(300, do_analyze)
+            if not capture_stream(link, dlg, done):
+                cap_b.configure(state="normal")
+
         h, create_b = button(btns, "Create and test", do_create, width=15)
         h.pack(side="left")
+        h, cap_b = button(btns, "Capture from a browser window", do_capture, width=27)
+        h.pack(side="left", padx=(px(6), 0))
         h, use_b = button(btns, "Use as stream link", use_stream_line, width=17)
         h.pack(side="left", padx=(px(6), 0))
         h, _ = button(btns, "Copy log", copy_log, width=10)
@@ -5026,7 +5336,8 @@ def run_gui():
     m_tools.add_separator()
     m_tools.add_command(label="Check a site or link...", command=site_check_dialog)
     m_tools.add_command(label="Fix YouTube \"403 Forbidden\" (PO tokens)...", command=pot_dialog)
-    m_tools.add_command(label="Add a stream link (.m3u8 / .mpd)...", command=add_stream_link)
+    m_tools.add_command(label="Capture a video's stream address...", command=capture_tool)
+    m_tools.add_command(label="Add a stream link (.m3u8 / .mpd)...", command=lambda: add_stream_link())
     m_tools.add_separator()
     m_tools.add_command(label="Open yt-dlp plugin folder", command=open_plugins)
     m_tools.add_command(label="Teach Video Archiver a new site...", command=teach_site_dialog)
