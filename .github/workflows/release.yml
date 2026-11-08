@@ -1,0 +1,95 @@
+name: release
+
+# Builds "Video-Archiver-<version>.exe" on GitHub's own Windows machine and attaches
+# it to the release, together with its checksum and the source code of the bundled
+# GPL programs. Runs when you publish a release. You can also start it by hand
+# (Actions > release > Run workflow): with a tag (for example v1.3.0) it builds the
+# exe for that existing release; left empty, it's a test build kept under the run.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release to attach the exe to (for example v1.3.0). Empty = test build only."
+        required: false
+        default: ""
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Builder matches the source files
+        shell: bash
+        run: |
+          python tools/make_bat.py
+          git diff --exit-code Build_Video_Archiver.bat || (echo "::error::Run 'python tools/make_bat.py' and commit Build_Video_Archiver.bat" && exit 1)
+
+      - name: Version in the app matches the release tag
+        if: env.TAG != ''
+        shell: bash
+        run: |
+          app=$(python -c "import sys; sys.path.insert(0, 'src'); import video_archiver as v; print(v.APP_VERSION)")
+          tag="$TAG"
+          if [ "v$app" != "$tag" ]; then
+            echo "::error::The release tag is $tag, but APP_VERSION in src/video_archiver.py is $app. Make them match (tag v$app)."
+            exit 1
+          fi
+
+      - name: Build the exe (downloads and checks yt-dlp, FFmpeg and Deno)
+        shell: pwsh
+        run: |
+          python -m pip install -q --disable-pip-version-check "pyinstaller==6.22.3"
+          python src/build.py "$env:RUNNER_TEMP\va-build" --dist release
+
+      - name: The exe starts
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem release\Video-Archiver-*.exe | Select-Object -First 1
+          if (-not $exe -or $exe.Length -lt 20MB) { throw "The exe is missing or too small (the tools should be inside it)." }
+          Write-Host "$($exe.Name): $([math]::Round($exe.Length / 1MB)) MB"
+
+      - name: Source code of the bundled GPL programs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ytdlp=$(python -c "import sys; sys.path.insert(0, 'src'); import build; print(build.YTDLP_VERSION)")
+          curl -fsSL -o "release/yt-dlp-$ytdlp-source.tar.gz" "https://github.com/yt-dlp/yt-dlp/archive/refs/tags/$ytdlp.tar.gz"
+          short=$(cat release/ffmpeg-commit.txt)
+          if [ -z "$short" ]; then
+            echo "::error::Couldn't read FFmpeg's version from the build, so its source can't be attached."
+            exit 1
+          fi
+          full=$(gh api "repos/FFmpeg/FFmpeg/commits/$short" --jq .sha)
+          curl -fsSL -o "release/ffmpeg-$short-source.tar.gz" "https://github.com/FFmpeg/FFmpeg/archive/$full.tar.gz"
+          rm release/ffmpeg-commit.txt
+          ls -l release
+
+      - name: Attach to the release
+        if: env.TAG != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" release/* --clobber
+
+      - name: Keep the files (for a test run)
+        if: env.TAG == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-archiver-windows
+          path: release/
