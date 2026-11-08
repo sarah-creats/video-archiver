@@ -13,6 +13,7 @@ import hashlib
 import html
 import http.client
 import io
+import codecs
 import json
 import urllib.error
 import urllib.parse
@@ -92,6 +93,12 @@ MP3_HINT = ("YouTube audio is about 130-160 kbps, so no setting adds quality. "
 MP4_HINT_HD = "H.264 video with AAC audio. Plays on practically everything."
 MP4_HINT_UHD = ("1440p and 4K only exist as VP9 or AV1. VLC and browsers play them; "
                 "some TVs, phones and Windows players need extra codecs or can't play them.")
+ORIGINAL_HINT_VIDEO = ("Original quality: the best video and audio exactly as the site has them (on YouTube "
+                       "usually VP9/AV1 video and Opus audio), nothing converted. Saved as .mkv: VLC, browsers "
+                       "and Windows 11 play it; some older TVs and phones don't.")
+ORIGINAL_HINT_AUDIO = ("Original quality: the site's best audio track, not converted (on YouTube usually Opus, "
+                       "saved as .opus; elsewhere often .m4a). Better than MP3 for whispers and binaural "
+                       "sound. VLC, browsers and most phones play it.")
 
 COMMON_ARGS = ["--ignore-config", "--encoding", "utf-8", "--color", "never"]
 LIVE_FILTER = "!is_live & live_status!=?is_upcoming & live_status!=?post_live"
@@ -163,6 +170,20 @@ def acquire_single_instance():
         return False
     except Exception:
         return True  # if the check itself fails, don't lock the user out
+
+
+def release_single_instance():
+    """Let another copy start (used right before starting the freshly installed exe)."""
+    global _instance_handle
+    try:
+        if sys.platform == "win32" and _instance_handle:
+            import ctypes
+            ctypes.WinDLL("kernel32").CloseHandle(ctypes.c_void_p(_instance_handle))
+        elif _instance_handle:
+            _instance_handle.close()
+    except Exception:
+        pass
+    _instance_handle = None
 
 
 def clean_stale_bundles():
@@ -319,15 +340,136 @@ def update_ytdlp():
 # --------------------------------------------------------------------------
 
 def parse_link_line(line):
-    """'URL | referer=PAGE | title=TITLE' -> (URL, {"referer": ..., "title": ...})."""
+    """'URL | referer=PAGE | title=TITLE | folder=NAME' -> (URL, {"referer": ..., ...}).
+    folder= puts a single video into a subfolder (followed channels use it)."""
     parts = [p.strip() for p in str(line).split(" | ")]
     url, opts = parts[0], {}
     for part in parts[1:]:
         key, sep, value = part.partition("=")
         key = key.strip().lower()
-        if sep and key in ("referer", "title") and value.strip():
+        if sep and key in ("referer", "title", "folder") and value.strip():
             opts[key] = value.strip()
     return url, opts
+
+
+# --------------------------------------------------------------------------
+# Followed channels: fetch only the videos that are new since last time
+# --------------------------------------------------------------------------
+
+FOLLOW_FILE = DATA_DIR / "followed.json"
+FOLLOW_CHECK_LIMIT = 100     # newest videos looked at in each check
+FOLLOW_FIRST_LIMIT = 5000    # how far back the first look at a channel goes
+FOLLOW_GIVE_UP = 3           # a video that fails this often is left out after that
+FOLLOW_TASK = "Video Archiver - check followed channels"
+FOLLOW_EVERY = {"Never": 0, "hour": 1, "3 hours": 3, "6 hours": 6, "12 hours": 12, "24 hours": 24}
+
+
+def channel_url(url):
+    """The link to follow. A YouTube channel's main page lists tabs, not videos: use its
+    Videos tab. Other sites' channel/profile/playlist links stay as they are."""
+    url = str(url).strip()
+    m = re.match(r"(https?://(?:www\.|m\.)?youtube\.com/(?:@[^/?#]+|channel/[^/?#]+|c/[^/?#]+|user/[^/?#]+))"
+                 r"/?(?:featured)?/?(?:[?#].*)?$", url, re.I)
+    return m.group(1) + "/videos" if m else url
+
+
+def load_follows():
+    try:
+        data = json.loads(FOLLOW_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("channels"), list):
+            return data
+    except Exception:
+        pass
+    return {"channels": []}
+
+
+def save_follows(data):
+    FOLLOW_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = FOLLOW_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    os.replace(tmp, FOLLOW_FILE)
+
+
+def follow_find(data, url):
+    url = channel_url(url)
+    return next((c for c in data["channels"] if c.get("url") == url), None)
+
+
+def follow_add(data, url, title, entries, download_existing):
+    """Start following. download_existing=False: everything there now counts as seen,
+    so only videos that come out later are fetched."""
+    ch = follow_find(data, url)
+    if ch is None:
+        ch = {"url": channel_url(url), "added": time.strftime("%Y-%m-%d")}
+        data["channels"].append(ch)
+    ch["title"] = title or ch.get("title") or channel_url(url)
+    ch["seen"] = [] if download_existing else [e["id"] for e in entries if e.get("id")]
+    ch["fails"] = {}
+    return ch
+
+
+def follow_new(ch, entries):
+    """The entries not fetched yet, oldest first. Live and upcoming videos wait until
+    they're finished (and aren't counted as seen)."""
+    seen = set(ch.get("seen") or [])
+    new = [e for e in entries if e.get("id") and e["id"] not in seen
+           and e.get("live_status") not in LIVE_STATES and not e.get("is_live")]
+    return list(reversed(new))
+
+
+def follow_line(ch, entry):
+    """One line for Step 1: the video's link, into a folder named after the channel."""
+    url = entry.get("url") or entry.get("webpage_url")
+    if url and not re.match(r"https?://", url) and is_youtube(entry):
+        url = f"https://www.youtube.com/watch?v={entry['id']}"
+    folder = re.sub(r"\s*\|\s*", " - ", ch.get("title") or "Channel")
+    return f"{url} | folder={folder}"
+
+
+def follow_record(ch, tried_ids, ok_ids):
+    """After a run: videos that worked count as seen; the others are tried again next
+    time, up to FOLLOW_GIVE_UP times. Returns the ids given up on."""
+    seen, fails, gave_up = list(ch.get("seen") or []), dict(ch.get("fails") or {}), []
+    have = set(seen)
+    for vid in tried_ids:
+        if vid in ok_ids:
+            fails.pop(vid, None)
+        else:
+            fails[vid] = fails.get(vid, 0) + 1
+            if fails[vid] < FOLLOW_GIVE_UP:
+                continue
+            fails.pop(vid, None)
+            gave_up.append(vid)
+        if vid not in have:
+            seen.append(vid)
+            have.add(vid)
+    ch["seen"], ch["fails"] = seen, fails
+    return gave_up
+
+
+def daily_task_command():
+    """What Windows' Task Scheduler runs: the installed app with --check-followed."""
+    exe = Path(sys.executable) if getattr(sys, "frozen", False) else INSTALL_EXE
+    return f'"{exe}" --check-followed'
+
+
+def set_daily_task(on, at="18:00"):
+    """Create or remove the daily check in Windows' Task Scheduler (only for this user,
+    no admin rights needed). Returns an error text, or None."""
+    if sys.platform != "win32":
+        return "Only available on Windows."
+    if on:
+        args = ["schtasks", "/Create", "/F", "/TN", FOLLOW_TASK, "/SC", "DAILY", "/ST", at,
+                "/TR", daily_task_command()]
+    else:
+        args = ["schtasks", "/Delete", "/F", "/TN", FOLLOW_TASK]
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, creationflags=NO_WINDOW, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return str(exc)
+    if r.returncode != 0 and on:
+        return (r.stderr or r.stdout or "schtasks failed").strip()
+    return None
 
 
 def is_stream_url(url):
@@ -335,8 +477,19 @@ def is_stream_url(url):
 
 
 def stream_id(url):
-    """Stable id for a stream link (they're all called 'master' or 'index')."""
-    return "s-" + hashlib.md5(str(url).split("?")[0].encode("utf-8")).hexdigest()[:10]
+    """Stable id for a stream link (they're all called 'master' or 'index'). The part after
+    ? is usually a token that changes, so it's left out, unless the address has no .m3u8/.mpd
+    in it: then the query is what tells videos apart (/api/source?id=7 and ?id=8)."""
+    url = str(url).split("#")[0]
+    key = url.split("?")[0]
+    if not is_stream_url(url) and "?" in url:
+        token = re.compile(r"(?i)^(token|t|e|exp|expires?|sig|signature|hash|st|auth|hdnts|hdnea|policy|"
+                           r"key-pair-id|ts|time|timestamp|ip|session|sid|_)$")
+        keep = sorted((k, v) for k, v in urllib.parse.parse_qsl(url.split("?", 1)[1], keep_blank_values=True)
+                      if not token.match(k) and len(v) <= 40)
+        if keep:
+            key += "?" + urllib.parse.urlencode(keep)
+    return "s-" + hashlib.md5(key.encode("utf-8")).hexdigest()[:10]
 
 
 def stream_title(url, page=None):
@@ -915,27 +1068,255 @@ def find_browser():
     return None
 
 
+_LOG_URL_RE = re.compile(r'"(https?://[^"\\]*(?:\\.[^"\\]*)*)"')
+
+
+class NetlogReader:
+    """Reads a browser network log, also while the browser is still writing it, and
+    keeps track of the video addresses and stream pieces (segments) it mentions.
+
+    Each request's real content type and size come from the log too, so a stream is
+    found even when its address hides it (/api/source?id=7, pieces named img1.jpg)."""
+
+    PLAYLIST_TYPES = ("mpegurl", "dash+xml")                 # application/vnd.apple.mpegurl, x-mpegURL, ...
+    SEGMENT_TYPES = ("video/mp2t", "video/iso.segment", "audio/mp2t", "video/vnd.dlna.mpeg-tts")
+    BIG = 1 << 20                                           # a plain video file: at least 1 MB loaded
+
+    def __init__(self):
+        self.seen, self.found, self.segment_urls = set(), [], []
+        self.requests = 0          # how many requests the log showed so far (0 = nothing is being read)
+        self._rest = ""
+        self._src = {}             # request id -> {"url", "type", "size", "bytes", "range"}
+        self._by_url = {}          # url -> that dict (the last request for it)
+        self._seg = set()
+        self._order = {}           # url -> when it was first seen
+        self._hits = {}            # url -> how often it was loaded (a live playlist: every few seconds)
+
+    # --- reading ---
+    def feed(self, text, final=True):
+        text = self._rest + text
+        cut = len(text) if final else text.rfind("\n") + 1      # never read half a line
+        chunk, self._rest = text[:cut], text[cut:]
+        for line in chunk.splitlines():
+            ev = None
+            t = line.strip().rstrip(",")
+            if t.startswith("{") and t.endswith("}") and '"source"' in t:
+                try:
+                    ev = json.loads(t)
+                except ValueError:
+                    ev = None
+            if isinstance(ev, dict) and isinstance(ev.get("source"), dict):
+                self._event(ev)
+            else:                       # the header line, or a log in an unexpected shape
+                for raw in _LOG_URL_RE.findall(line):
+                    try:
+                        url = json.loads('"' + raw + '"')
+                    except ValueError:
+                        url = raw
+                    self._add_url(url, None)
+        return self
+
+    def _event(self, ev):
+        src, params = ev["source"], ev.get("params")
+        if not isinstance(params, dict):
+            return
+        sid = src.get("id")
+        url = params.get("url")
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            if src.get("type") == 1:            # a URL_REQUEST: one load of one address
+                if sid not in self._src:
+                    r = self._src[sid] = {"url": url, "type": "", "size": 0, "bytes": 0, "range": False}
+                    self.requests += 1
+                    self._hits[url] = self._hits.get(url, 0) + 1
+                    self._by_url[url] = r
+                    self._add_url(url, r)
+            else:
+                self._add_url(url, None)
+            return
+        r = self._src.get(sid)
+        if r is None:
+            return
+        heads = params.get("headers")
+        if isinstance(heads, list) and heads and str(heads[0]).startswith("HTTP/"):
+            for h in heads[1:]:
+                k, _, v = str(h).partition(":")
+                k, v = k.strip().lower(), v.strip()
+                if k == "content-type":
+                    r["type"] = v.split(";")[0].strip().lower()
+                elif k == "content-length" and v.isdigit():
+                    r["size"] = int(v)
+                elif k == "content-range":
+                    r["range"] = True
+                    total = v.rsplit("/", 1)[-1]
+                    if total.isdigit():
+                        r["size"] = int(total)
+            self._classify(r["url"], r)
+        elif isinstance(params.get("byte_count"), int) and not params.get("source_dependency"):
+            r["bytes"] += params["byte_count"]
+
+    def _add_url(self, url, r):
+        if url in self.seen:
+            return
+        self.seen.add(url)
+        self._order[url] = len(self._order)
+        self._classify(url, r)
+
+    def _classify(self, url, r):
+        core = plugin_core()
+        ctype = (r or {}).get("type", "")
+        path = urllib.parse.urlsplit(url).path.lower()
+        ext = path.rsplit(".", 1)[-1] if "." in path.rsplit("/", 1)[-1] else ""
+        playlist = (core["stream_ext"](url) in ("m3u8", "mpd") or any(t in ctype for t in self.PLAYLIST_TYPES)
+                    or re.search(r"\.(m3u8|mpd)(?:$|[?&#])", url.lower()) is not None)
+        if ext in SEGMENT_EXTS or ctype in self.SEGMENT_TYPES:
+            if url not in self._seg:
+                self._seg.add(url)
+                self.segment_urls.append(url)
+            if url in self.found and not playlist:
+                self.found.remove(url)
+            return
+        media = core["stream_ext"](url) or ctype.startswith(("video/", "audio/"))
+        if (playlist or media) and url not in self.found:
+            self.found.append(url)
+
+    # --- results ---
+    def _info(self, url):
+        return self._by_url.get(url) or {}
+
+    DISGUISE_TYPES = ("image/", "text/", "application/octet-stream", "binary/", "application/binary")
+
+    def _disguised(self):
+        """Stream pieces that pretend to be something else (img12.jpg sent as image/jpeg):
+        at least 3 numbered loads of 150 KB or more from one folder."""
+        groups = {}
+        for r in self._src.values():
+            url = r["url"]
+            if url in self._seg or not (r["type"] == "" or r["type"].startswith(self.DISGUISE_TYPES)):
+                continue
+            if max(r["bytes"], r["size"]) < 100 * 1024:
+                continue
+            q = urllib.parse.urlsplit(url)
+            folder, name = q.path.rsplit("/", 1) if "/" in q.path else ("", q.path)
+            if not re.search(r"\d", name + q.query):
+                continue
+            groups.setdefault((q.hostname, folder), set()).add(url)
+        return {u for urls in groups.values() if len(urls) >= 3 for u in urls}
+
+    def _all_segments(self):
+        extra = self._disguised()
+        return self.segment_urls + sorted(extra - self._seg, key=lambda u: self._order.get(u, 0))
+
+    def _attribute(self):
+        """{playlist: (pieces, bytes)}. A piece belongs to the playlist in the closest folder
+        above it; pieces from another server go to the playlist loaded just before them."""
+        lists = [u for u in self.found if self._kind(u) in ("m3u8", "mpd")]
+        folders = []
+        for u in lists:
+            pu = urllib.parse.urlsplit(u)
+            folders.append((u, pu.hostname, pu.path.rsplit("/", 1)[0] + "/"))
+        out = {u: [0, 0] for u in lists}
+        for seg in self._all_segments():
+            q = urllib.parse.urlsplit(seg)
+            best, best_len = None, -1
+            for u, host, folder in folders:
+                if host == q.hostname and q.path.startswith(folder) and len(folder) > best_len:
+                    best, best_len = u, len(folder)
+            if best is None:
+                at = self._order.get(seg, 0)
+                earlier = [u for u in lists if self._order.get(u, 0) < at]
+                best = max(earlier, key=lambda u: self._order.get(u, 0)) if earlier else None
+            if best is not None:
+                out[best][0] += 1
+                out[best][1] += self._info(seg).get("bytes", 0)
+        return out
+
+    def pieces(self, url):
+        """How many stream pieces came from this playlist's address."""
+        return self._attribute().get(url, [0, 0])[0]
+
+    def _kind(self, url):
+        core = plugin_core()
+        ctype = self._info(url).get("type", "")
+        if core["stream_ext"](url) == "m3u8" or "mpegurl" in ctype or ".m3u8" in url.lower():
+            return "m3u8"
+        if core["stream_ext"](url) == "mpd" or "dash+xml" in ctype or ".mpd" in url.lower():
+            return "mpd"
+        return core["stream_ext"](url) or (ctype.split("/")[-1] if ctype else "")
+
+    def _weight(self, url, att):
+        """(bytes loaded, pieces): how much of this video the browser actually played."""
+        if url in att:
+            n, size = att[url]
+            return size, n
+        return sum(r["bytes"] for r in self._src.values() if r["url"] == url) or self._info(url).get("size", 0), 0
+
+    def is_live(self, url):
+        """A live stream (often a live-cam ad box on the page): its playlist is loaded again
+        and again. Judged only by that, never by the server's name: a site's own saved videos
+        can come from the same servers as its live streams."""
+        return self._kind(url) in ("m3u8", "mpd") and self._hits.get(url, 0) >= 3
+
+    def _wanted(self, url):
+        """Leave out tiny audio/video responses (click sounds, 1-second ad pings)."""
+        info = self._info(url)
+        if self._kind(url) in ("m3u8", "mpd"):
+            return True
+        got = max(info.get("size", 0), info.get("bytes", 0))
+        if not got and plugin_core()["stream_ext"](url):
+            return True             # size unknown (an older log): trust the .mp4/.mp3 ending
+        return bool(info.get("range")) or got >= self.BIG
+
+    def candidates(self):
+        """[(address, pieces)], best first: not an ad, most video loaded from it (the video
+        you watched, not a short ad), playlist before plain file."""
+        core = plugin_core()
+        rank = {"m3u8": 0, "mpd": 1, "mp4": 2, "webm": 3, "m4a": 4, "mp3": 5}
+        junk = core["_JUNK_RE"]
+        att = self._attribute()
+        scored = []
+        for i, u in enumerate(self.found):
+            if not self._wanted(u):
+                continue
+            size, n = self._weight(u, att)
+            scored.append((bool(junk.search(u)) or self.is_live(u), -size, -n, rank.get(self._kind(u), 9), i, u, n))
+        scored.sort()
+        return [(t[5], t[6]) for t in scored]
+
+    def media_bytes(self):
+        """How much video/audio the browser has loaded so far (any address)."""
+        pieces = self._seg | self._disguised()
+        return sum(r["bytes"] for r in self._src.values()
+                   if r["url"] in pieces or r["type"].startswith(("video/", "audio/")))
+
+    def biggest(self, n=6):
+        """The largest loads, for the activity log when nothing looked like a video:
+        [(megabytes, content type, address)]."""
+        total = {}
+        for r in self._src.values():
+            got = r["bytes"] or r["size"]
+            key = r["url"]
+            if key not in total or got > total[key][0]:
+                total[key] = (got, r["type"] or "?")
+        top = sorted(((b, t, u) for u, (b, t) in total.items() if b), reverse=True)[:n]
+        return [(round(b / 1048576, 1), t, u) for b, t, u in top]
+
+    def type_summary(self, n=8):
+        """[(content type, loads, megabytes)], most data first: what the browser loaded."""
+        out = {}
+        for r in self._src.values():
+            t = r["type"] or "?"
+            c, b = out.get(t, (0, 0))
+            out[t] = (c + 1, b + (r["bytes"] or r["size"]))
+        top = sorted(out.items(), key=lambda kv: -kv[1][1])[:n]
+        return [(t, c, round(b / 1048576, 1)) for t, (c, b) in top]
+
+    def result(self):
+        return [u for u, _ in self.candidates()], len(self._all_segments())
+
+
 def parse_netlog(text):
-    """Video addresses the browser loaded, best first, and how many stream pieces
-    (segments) it loaded. The first .m3u8 loaded is normally the main playlist."""
-    core = plugin_core()
-    seen, found, segments = set(), [], 0
-    for raw in re.findall(r'"(https?://[^"\\]*(?:\\.[^"\\]*)*)"', text):
-        try:
-            url = json.loads('"' + raw + '"')
-        except ValueError:
-            url = raw
-        if url in seen:
-            continue
-        seen.add(url)
-        if core["stream_ext"](url):
-            found.append(url)
-        elif urllib.parse.urlsplit(url).path.lower().rsplit(".", 1)[-1] in SEGMENT_EXTS:
-            segments += 1
-    rank = {"m3u8": 0, "mpd": 1, "mp4": 2, "webm": 3, "m4a": 4, "mp3": 5}
-    junk = core["_JUNK_RE"]
-    found.sort(key=lambda u: (bool(junk.search(u)), rank.get(core["stream_ext"](u), 9)))
-    return found, segments
+    """Video addresses the browser loaded, best first, and how many stream pieces it loaded."""
+    return NetlogReader().feed(text).result()
 
 
 class BrowserCapture:
@@ -946,38 +1327,84 @@ class BrowserCapture:
         self.page_url = page_url
         self.browser = browser or find_browser()
         self.dir = Path(tempfile.mkdtemp(prefix="va-capture-"))
+        self.profile = self.dir / "profile"
         self.log = self.dir / "net.json"
         self.proc = None
+        self.reader = NetlogReader()
+        self._pos = 0
+        self._dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self.started = 0.0
 
     def start(self, extra_args=()):
         if not self.browser:
             raise OSError("No Microsoft Edge, Google Chrome or Brave found on this PC.")
-        args = [str(self.browser), f"--user-data-dir={self.dir / 'profile'}", f"--log-net-log={self.log}",
-                "--no-first-run", "--no-default-browser-check", "--disable-sync", *extra_args,
-                "--new-window", self.page_url]
+        # --test-type hides the "unsupported command-line flag" bar the network log causes
+        args = [str(self.browser), f"--user-data-dir={self.profile}", f"--log-net-log={self.log}",
+                "--test-type", "--no-first-run", "--no-default-browser-check", "--disable-sync",
+                *extra_args, "--new-window", self.page_url]
         self.proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL)
+        self.started = time.monotonic()
 
-    def finish(self, wait=15):
-        """Close the window (politely first, so the browser finishes its log), then
-        read the log and delete the throwaway profile. Returns (addresses, segments)."""
+    def peek(self):
+        """Read what the browser has logged so far. Returns [(address, pieces)], best first."""
+        try:
+            with open(self.log, "rb") as f:
+                f.seek(self._pos)
+                data = f.read()
+            self._pos += len(data)
+            self.reader.feed(self._dec.decode(data), final=False)
+        except OSError:
+            pass
+        return self.reader.candidates()
+
+    def running(self):
+        """Is the capture browser still open? (Edge may hand the window to a second process,
+        so the profile's lock file counts too.)"""
+        if self.proc and self.proc.poll() is None:
+            return True
+        return any((self.profile / name).exists() or (self.profile / name).is_symlink()
+                   for name in ("lockfile", "SingletonLock"))
+
+    def close(self, wait=12):
+        """Close every browser process using the throwaway profile: politely first (so the
+        log is finished), then by force."""
+        if sys.platform == "win32":
+            script = ("$p = Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and "
+                      "$_.CommandLine.Contains($env:VA_PROFILE) };"
+                      "foreach ($x in $p) { try { (Get-Process -Id $x.ProcessId).CloseMainWindow() | Out-Null } catch {} };"
+                      "for ($i = 0; $i -lt " + str(wait * 2) + "; $i++) { Start-Sleep -Milliseconds 500;"
+                      " if (-not (Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and "
+                      "$_.CommandLine.Contains($env:VA_PROFILE) })) { break } };"
+                      "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and "
+                      "$_.CommandLine.Contains($env:VA_PROFILE) } | ForEach-Object { "
+                      "Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }")
+            try:
+                subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                               capture_output=True, timeout=wait + 30, creationflags=NO_WINDOW,
+                               env={**os.environ, "VA_PROFILE": str(self.profile)})
+            except (OSError, subprocess.SubprocessError):
+                pass
         if self.proc and self.proc.poll() is None:
             try:
-                if sys.platform == "win32":
-                    subprocess.run(["taskkill", "/PID", str(self.proc.pid), "/T"], capture_output=True,
-                                   creationflags=NO_WINDOW)
-                else:
+                if sys.platform != "win32":
                     self.proc.terminate()
                 self.proc.wait(wait)
             except (subprocess.TimeoutExpired, OSError):
                 kill_tree(self.proc)
+
+    def finish(self):
+        """Close the browser, read the rest of the log, delete the throwaway profile.
+        Returns (addresses best first, stream pieces)."""
+        self.close()
         try:
-            text = self.log.read_text(encoding="utf-8", errors="replace")
+            with open(self.log, "rb") as f:
+                f.seek(self._pos)
+                self.reader.feed(self._dec.decode(f.read(), final=True), final=True)
         except OSError:
-            text = ""
-        result = parse_netlog(text)
+            pass
         _rmtree_retry(self.dir)
-        return result
+        return self.reader.result()
 
 
 _extractor_cache = []
@@ -1246,6 +1673,7 @@ INSTALL_DIR = Path(_local) / "Programs" / APP_NAME
 INSTALL_EXE = INSTALL_DIR / (APP_NAME + ".exe")
 UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall" + "\\" + APP_ID
 APP_BLURB = "Save videos from YouTube and 1000+ sites, and archive them on archive.org"
+APP_VERSION = "1.3.0"
 
 # The app's icon: a teal floppy disk with an upload arrow.
 ICON_ROWS = ["KKKKKKKKKKKKKK..",
@@ -1418,6 +1846,71 @@ def remove_old_install(say=lambda text: None, desktop=None, programs=None, is_ou
     return left
 
 
+def register_app(exe):
+    """List the app under Settings > Apps, with Uninstall pointing at the exe."""
+    import winreg
+    values = {"DisplayName": APP_NAME, "DisplayIcon": f"{exe},0",
+              "DisplayVersion": APP_VERSION, "Publisher": APP_NAME + " (open source)",
+              "Comments": APP_BLURB, "InstallLocation": str(exe.parent),
+              "UninstallString": f'"{exe}" --uninstall'}
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY) as key:
+        for name, value in values.items():
+            winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
+        for name, value in (("NoModify", 1), ("NoRepair", 1),
+                            ("EstimatedSize", max(1, exe.stat().st_size // 1024))):
+            winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, value)
+
+
+def install_app(exe, say=lambda text: None):
+    """Copy the exe to its own Programs folder, add shortcuts and the Settings > Apps
+    entry. Used by the builder and by a downloaded exe installing itself. Raises
+    OSError if the exe can't be copied (usually: the installed copy is open)."""
+    exe = Path(exe)
+    left = remove_old_install(say)
+    if left:
+        say("      Note: YT Archiver (the old name) is probably still open, so these stay. Close it")
+        say("      and delete them by hand: " + "; ".join(left))
+    note = migrate_old_data()
+    if note:
+        say("      " + note)
+    say(f"      Installing to {INSTALL_DIR}...")
+    INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+    if exe.resolve() != INSTALL_EXE.resolve():
+        shutil.copy2(exe, INSTALL_EXE)
+    say(f"      Size: {INSTALL_EXE.stat().st_size >> 20} MB")
+    if sys.platform != "win32":
+        return
+    desktop = known_folder("Desktop", Path.home() / "Desktop")
+    old = desktop / f"{APP_NAME}.exe"   # an early version put a bare exe on the desktop
+    if old.is_file():
+        try:
+            old.unlink()
+            say(f"      Removed the old {old.name} from the desktop (replaced by a shortcut).")
+        except OSError:
+            say(f"      Note: couldn't remove the old {old.name} from the desktop. Close it "
+                "and delete it by hand; the shortcut replaces it.")
+    for lnk in (desktop / f"{APP_NAME}.lnk", known_folder("Programs", Path.home()) / f"{APP_NAME}.lnk"):
+        if make_shortcut(lnk, INSTALL_EXE):
+            say(f"      Shortcut: {lnk}")
+        else:
+            say(f"      Note: couldn't create the shortcut {lnk}")
+    try:
+        register_app(INSTALL_EXE)
+        say("      Listed under Settings > Apps (uninstall from there or from Help).")
+    except OSError:
+        say("      Note: couldn't add the Settings > Apps entry. Help > Uninstall still works.")
+
+
+def running_installed():
+    """True when this is the installed copy (or not a built exe at all)."""
+    if not getattr(sys, "frozen", False):
+        return True
+    try:
+        return Path(sys.executable).resolve() == INSTALL_EXE.resolve()
+    except OSError:
+        return False
+
+
 def uninstall_files():
     """Remove shortcuts, the Apps entry, tools, settings and keys, then the exe
     itself once this program has closed. Downloads and uploads are left alone.
@@ -1438,6 +1931,7 @@ def uninstall_files():
             except OSError:
                 problems.append(str(lnk))
     if sys.platform == "win32":
+        set_daily_task(False)            # the daily check of followed channels, if it was on
         import winreg
         try:
             winreg.DeleteKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY)
@@ -2403,6 +2897,7 @@ LICENSES = {
 }
 IA_PART_SIZE = 64 << 20                   # resumable uploads go in 64 MB parts
 IA_MULTIPART_OVER = 200 << 20             # files bigger than this use parts
+IA_PART_WORKERS = 3                       # parts sent at the same time (archive.org accepts this)
 IA_PART_WAITS = (15, 30, 60, 120, 240, 300, 300)   # long enough for Wi-Fi to come back
 UPLOADS_DIR = DATA_DIR / "uploads"        # progress of unfinished uploads
 
@@ -2608,36 +3103,73 @@ def ia_upload_parts(keys, identifier, path, remote, meta_headers, on_progress, c
     sent_before = sum(min(IA_PART_SIZE, size - (int(n) - 1) * IA_PART_SIZE) for n in j["parts"])
     t0, base = time.monotonic(), [sent_before]
     uid = urllib.parse.quote(j["upload_id"])
-    with open(path, "rb") as f:
-        for n in range(1, n_parts + 1):
-            if cancel.is_set():
-                raise Cancelled()
-            if str(n) in j["parts"]:
-                continue
+    todo = [n for n in range(1, n_parts + 1) if str(n) not in j["parts"]]
+    lock, live, stop = threading.Lock(), {}, threading.Event()
+
+    class _Either:
+        # Stop from the user, or another part failed: both end the upload
+        @staticmethod
+        def is_set():
+            return cancel.is_set() or stop.is_set()
+
+        @staticmethod
+        def wait(t=None):
+            end_at = time.monotonic() + (t or 0)
+            while time.monotonic() < end_at:
+                if cancel.is_set() or stop.is_set():
+                    return True
+                time.sleep(0.2)
+            return cancel.is_set() or stop.is_set()
+    either = _Either()
+
+    def send(n):
+        if either.is_set():
+            raise Cancelled()
+        with open(path, "rb") as f:          # every part reads its own slice of the file
             f.seek((n - 1) * IA_PART_SIZE)
             data = f.read(IA_PART_SIZE)
-            md5 = hashlib.md5(data)
+        md5 = hashlib.md5(data)
 
-            def progress(done, total, speed, eta, _n=n):
-                now = base[0] + done
-                rate = (now - sent_before) / max(time.monotonic() - t0, 0.001)
-                on_progress(now, size, rate, (size - now) / rate if rate else None)
+        def progress(done, total, speed, eta):
+            with lock:
+                live[n] = done
+                now = base[0] + sum(live.values())
+            rate = (now - sent_before) / max(time.monotonic() - t0, 0.001)
+            on_progress(now, size, rate, (size - now) / rate if rate else None)
 
-            def put(_n=n, _data=data, _md5=md5, _progress=progress):
-                return _s3("PUT", f"{target}?partNumber={_n}&uploadId={uid}", {
-                    **auth, "Content-Length": str(len(_data)),
-                    "Content-MD5": base64.b64encode(_md5.digest()).decode()},
-                    body=_ProgressReader(io.BytesIO(_data), len(_data), _progress, cancel))
-            status, text = _retrying(put, f"Part {n} of {n_parts}", cancel, on_status)
-            if status == 404 or "NoSuchUpload" in text:
-                _forget_journal(jp)
-                raise IAError("archive.org forgot the unfinished upload (it was too old). Start the "
-                              "upload again; it will begin from the start.")
-            if status != 200:
-                raise _refused(status, text, keys, identifier, remote)
+        def put():
+            with lock:
+                live[n] = 0
+            return _s3("PUT", f"{target}?partNumber={n}&uploadId={uid}", {
+                **auth, "Content-Length": str(len(data)),
+                "Content-MD5": base64.b64encode(md5.digest()).decode()},
+                body=_ProgressReader(io.BytesIO(data), len(data), progress, either))
+        status, text = _retrying(put, f"Part {n} of {n_parts}", either, on_status)
+        if status == 404 or "NoSuchUpload" in text:
+            _forget_journal(jp)
+            raise IAError("archive.org forgot the unfinished upload (it was too old). Start the "
+                          "upload again; it will begin from the start.")
+        if status != 200:
+            raise _refused(status, text, keys, identifier, remote)
+        with lock:
             j["parts"][str(n)] = md5.hexdigest()
             _save_journal(jp, j)
+            live.pop(n, None)
             base[0] += len(data)
+
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, IA_PART_WORKERS)) as pool:
+        futures = [pool.submit(send, n) for n in todo]
+        try:
+            for fut in concurrent.futures.as_completed(futures):
+                fut.result()
+        except BaseException:
+            stop.set()                        # the other parts stop too; finished ones stay saved
+            for fut in futures:
+                fut.cancel()
+            if cancel.is_set():
+                raise Cancelled()
+            raise
 
     if on_status:
         on_status("Putting the parts together on archive.org (can take a few minutes)...")
@@ -3079,15 +3611,48 @@ def scan_report(items, folder, refresh):
 # --------------------------------------------------------------------------
 
 
+class _UIRouter:
+    """Downloads and uploads run in two threads. Upload progress goes to its own line in
+    the window (ui.upload_progress / ui.upload_now) instead of the download's progress bar."""
+
+    def __init__(self, ui):
+        self._ui = ui
+
+    @staticmethod
+    def _uploading():
+        return threading.current_thread().name == "va-upload"
+
+    def progress(self, pct, detail):
+        if self._uploading():
+            f = getattr(self._ui, "upload_progress", None)
+            return f(pct, detail) if f else None
+        return self._ui.progress(pct, detail)
+
+    def now(self, text):
+        if self._uploading():
+            return None
+        return self._ui.now(text)
+
+    def upload_now(self, text):
+        f = getattr(self._ui, "upload_now", None)
+        return f(text) if f else None
+
+    def __getattr__(self, name):
+        return getattr(self._ui, name)
+
+
 class Job:
-    """ui needs: log(text, tag), now(text), progress(pct, detail), confirm(question)."""
+    """ui needs: log(text, tag), now(text), progress(pct, detail), confirm(question).
+    Optional: upload_progress(pct, detail), upload_now(name), review_blocked(items)."""
 
     def __init__(self, urls, mode, quality, out_dir, playlist, ui, cookies=False, archive=None,
-                 author="", hide_source=False, files=None):
+                 author="", hide_source=False, files=None, keep_local=True, original=False):
         self.urls, self.mode, self.quality = urls, mode, quality
+        # original: keep the site's best streams as they are (no MP3/AAC/H.264 preference)
+        self.original = original
         # files: items from scan_for_upload() -> upload these instead of downloading
         self.files = files
-        self.out_dir, self.playlist, self.ui = Path(out_dir), playlist, ui
+        self.out_dir, self.playlist, self.ui = Path(out_dir), playlist, _UIRouter(ui)
         self.cookies = cookies
         # archive: None, or {"keys": (access, secret), "prefix": ..., "username": ...}
         self.archive = archive
@@ -3099,16 +3664,27 @@ class Job:
         self.upload_blocked = None   # set when archive.org refuses the whole account
         self.blocked = []            # videos whose item is blocked: asked about at the end
         self._meta = {}
-        self.ext = "mp3" if mode == "mp3" else "mp4"
+        self.ext = ("mp3" if mode == "mp3" else "mp4") if not original else ("opus" if mode == "mp3" else "mkv")
         # yt-dlp works in here and only moves the finished file into your folder,
         # so Stop can simply empty this folder without touching anything of yours.
         self.staging = self.out_dir / STAGING_NAME / uuid.uuid4().hex[:8]
         self.cancel = threading.Event()
         self.cancelled = False
-        self.saved = self.existing = self.skipped = 0
+        self.saved = self.existing = self.skipped = self.removed = self.not_downloaded = 0
         self.failed = []
         self._seen_warnings = set()
         self._final = None
+        # downloads and uploads run side by side; counters are shared, so they're locked
+        self._lock = threading.Lock()
+        self._uploads = queue.Queue(maxsize=self.UPLOAD_QUEUE_MAX)
+        self._worker = None
+        # keep_local=False: download into a hidden cache, upload, then delete
+        self.keep_local = keep_local or not archive
+        self.cache_dir = self.out_dir / ".yta-upload-cache"
+        # thumbnails/subtitles for uploads; outside the work folder that Stop empties
+        self.extra_root = self.staging.parent / (self.staging.name + "-extra")
+        # which videos worked (followed channels count those as done)
+        self.done_ids, self.uploaded_ids = set(), set()
 
     # --- running yt-dlp ---
     def _run(self, args, on_line):
@@ -3201,6 +3777,7 @@ class Job:
 
     def _download_args(self, folder, in_playlist, entry=None):
         args = ["--newline", "--progress", "--no-simulate", "--no-playlist", "--no-overwrites",
+                "--concurrent-fragments", "4",          # stream pieces 4 at a time
                 "--windows-filenames", "--retries", "5", "--fragment-retries", "5",
                 "--ffmpeg-location", str(FFMPEG_DIR),
                 # Folders go in -P, so only the title is ever shortened and the
@@ -3218,10 +3795,19 @@ class Job:
         if self.archive and self.archive.get("extras"):
             # kept in the work folder (not next to your files) for archive.org
             args += ["--write-thumbnail", "--convert-thumbnails", "jpg",
-                     "-P", f"thumbnail:{self.staging / 'extra'}"]
+                     "-P", f"thumbnail:{self.extra_root}"]
         if in_playlist:
             args += PLAYLIST_SLEEP
-        if self.mode == "mp3":
+        if self.original and self.mode == "mp3":
+            # the best audio track as it is: Opus/M4A stay Opus/M4A (only the container may change)
+            args += ["-f", "bestaudio/best", "-x", "--audio-format", "best", "--embed-metadata",
+                     "--embed-thumbnail", "--convert-thumbnails", "jpg"]
+        elif self.original:
+            # best resolution up to the chosen one, then yt-dlp's own order (AV1/VP9, Opus first);
+            # MKV holds every codec, so nothing has to be converted
+            args += ["-f", "bv*+ba/b", "-S", f"res:{self.quality}",
+                     "--merge-output-format", "mkv", "--embed-metadata"]
+        elif self.mode == "mp3":
             args += ["-f", "bestaudio/best", "-x", "--audio-format", "mp3",
                      "--audio-quality", str(self.quality), "--embed-metadata",
                      "--embed-thumbnail", "--convert-thumbnails", "jpg"]
@@ -3280,7 +3866,7 @@ class Job:
                 e["_yta"] = opts
             if self._generic:
                 e["_yta_generic"] = True
-        if is_stream_url(url) or opts.get("title"):
+        if is_stream_url(url) or opts.get("title") or opts.get("referer"):
             # A stream address (.m3u8/.mpd) says nothing about the video: give it a
             # title and an id of its own, and remember the page it came from.
             for e in items:
@@ -3324,13 +3910,13 @@ class Job:
             return None, items
 
         if not self.playlist:
-            self.skipped += 1
+            self._count("skipped")
             self.ui.log(f"Skipped {url}: this is a playlist or channel link. Tick "
                         "\"download all of it\" to get the videos.", "warn")
             return None, []
         items = list(info.get("entries") or [])
         if any(self._is_container(e) for e in items):
-            self.skipped += 1
+            self._count("skipped")
             self.ui.log(f"Skipped {url}: this is a whole channel. Open the channel's "
                         "Videos tab or one of its playlists and paste that link.", "warn")
             return None, []
@@ -3346,17 +3932,23 @@ class Job:
             q = (f"\"{title}\" has {total} videos. Download the first {len(items)}?" if more
                  else f"\"{title}\" has {len(items)} videos. Download all of them?")
             if not self.ui.confirm(q):
-                self.skipped += 1
+                self._count("skipped")
                 self.ui.log(f"Skipped \"{title}\".", "warn")
                 return None, []
         return title, items
 
     AUDIO_EXTS = ("mp3", "m4a", "opus", "ogg", "oga", "flac", "wav", "aac")
+    VIDEO_EXTS = ("mp4", "mkv", "webm", "mov", "m4v", "avi")
 
     def _existing(self, folder, vid):
         if not folder.is_dir():
             return None
-        exts = [self.ext] + ([e for e in self.AUDIO_EXTS if e != self.ext] if self.mode == "mp4" else [])
+        if self.original or self.mode == "mp4":
+            # any copy of this video counts (an MP4 from before, an MKV, an audio-only site's file)
+            pool = self.VIDEO_EXTS + self.AUDIO_EXTS if self.mode == "mp4" else self.AUDIO_EXTS
+            exts = [self.ext] + [e for e in pool if e != self.ext]
+        else:
+            exts = [self.ext]
         for ext in exts:   # audio-only sites give audio files even in MP4 mode
             for p in folder.glob("*" + glob.escape(f"[{vid}].{ext}")):
                 return p
@@ -3386,18 +3978,31 @@ class Job:
         self.ui.progress(0, "Starting...")
 
         if vid and (found := self._existing(folder, vid)):
-            self.existing += 1
+            self.done_ids.add(vid)
+            self._count("existing")
             self.ui.log("Already in folder: " + found.name)
             if self.archive:
-                self._archive(found, None, vid, entry)
+                self._queue_upload(found, None, vid, entry)
             return
+        if self.archive and not self.keep_local and vid and not self.upload_blocked:
+            self.ui.progress(None, "Checking archive.org...")
+            page = self._already_uploaded(entry, vid)
+            if page:
+                self.done_ids.add(vid)
+                self.uploaded_ids.add(vid)
+                self._count("not_downloaded")
+                self.ui.log(f"Already on archive.org, so not downloaded: {page}")
+                return
+            folder = self.cache_dir / safe_folder(playlist_title) if playlist_title else self.cache_dir
         if entry.get("is_live") or entry.get("live_status") in LIVE_STATES:
-            self.skipped += 1
+            self._count("skipped")
             self.ui.log(f"Skipped \"{name}\": it's a live or upcoming stream. "
                         "Download it once the stream has ended.", "warn")
             return
 
         folder.mkdir(parents=True, exist_ok=True)
+        if self._in_cache(folder):
+            _hide(self.cache_dir)
         args, info_file = self._download_args(folder, playlist_title is not None, entry), None
         if "formats" in entry:  # a single video that was already looked up in full
             fd, info_file = tempfile.mkstemp(suffix=".info.json", dir=self.staging)
@@ -3423,16 +4028,19 @@ class Job:
                 except OSError:
                     pass
         if self._final:
-            self.saved += 1
-            self.ui.log("Saved: " + Path(self._final).name, "ok")
+            if vid:
+                self.done_ids.add(vid)
+            self._count("saved")
+            self.ui.log(("Downloaded for upload: " if self._in_cache(self._final) else "Saved: ")
+                        + Path(self._final).name, "ok")
             self._meta = self._overrides(self._meta, entry)
             remember_file(Path(self._final), {**self._site_info(entry), **self._meta}, entry)
             if self.author or self.hide_source or entry.get("_yta_title"):
                 self._retag(Path(self._final), {**self._site_info(entry), **self._meta})
             if self.archive:
-                self._archive(Path(self._final), self._meta, vid or self._meta.get("id"), entry)
+                self._queue_upload(Path(self._final), self._meta, vid or self._meta.get("id"), entry)
         elif code == 0 and not errors:
-            self.skipped += 1
+            self._count("skipped")
             self.ui.log(f"Skipped \"{name}\": yt-dlp didn't save a file. This usually means "
                         "it's a live or upcoming stream.", "warn")
         else:
@@ -3539,7 +4147,7 @@ class Job:
 
     # --- thumbnail and subtitles for archive.org ---
     def _extra_dir(self):
-        d = self.staging / "extra"
+        d = self.extra_root
         d.mkdir(parents=True, exist_ok=True)
         return d
 
@@ -3688,7 +4296,7 @@ class Job:
             return
         self.ui.progress(None, "Updating the item on archive.org...")
         ia_update_metadata(self.archive["keys"], ident, fields, remove)
-        self.retopiced += 1
+        self._count("retopiced")
         self.ui.log("   Updated: " + "; ".join(notes or ["details"]), "ok")
 
     def _ask(self, question, title):
@@ -3701,7 +4309,7 @@ class Job:
         """The video's item is blocked on archive.org. Don't stop the run to ask: note it
         and ask once at the end (or skip it silently if you said not to ask again)."""
         if ident in blocked_skips():
-            self.skipped += 1
+            self._count("skipped")
             self.ui.log(f"Not uploaded: {path.name} (its archive.org item is blocked; you chose to skip it).")
             return
         why = ("archive.org has hidden (\"darked\") it" if item.get("is_dark")
@@ -3739,13 +4347,13 @@ class Job:
             remember_rename(b["ident"], new)
             self.ui.log(f"Uploading {b['path'].name} under the new item name {new}.", "warn")
             self.ui.now(b["path"].name)
-            self._archive(b["path"], b["meta"], b["vid"], b["entry"])
+            self._archive_and_tidy(b["path"], b["meta"], b["vid"], b["entry"])
         self.blocked = []
 
     def _archive(self, path, meta, vid, entry):
         """Upload one saved file. Upload problems are reported, the job goes on."""
         if self.upload_blocked:
-            self.skipped += 1
+            self._count("skipped")
             self.ui.log(f"Not uploaded: {path.name} (archive.org refused the account earlier in this run; "
                         "use Upload files... later).", "warn")
             return
@@ -3777,11 +4385,11 @@ class Job:
                     raise IAError(f"\"{ident}\" is someone else's item. Change your identifier "
                                   "prefix under Options > archive.org account.")
                 if path.name in {f.get("name") for f in item.get("files") or []}:
-                    self.on_ia += 1
+                    self._count("on_ia")
                     self.ui.log("Already on archive.org: " + page)
                     if self.archive.get("refresh_topics"):
                         self._refresh_item(ident, item, meta, entry, vid, path)
-                    return
+                    return True
             if not meta or not meta.get("title"):
                 meta = self._fetch_meta(entry, vid, path)
             meta = prepare_meta({**self._site_info(entry), **meta}, self.hide_source, self.author)
@@ -3797,12 +4405,13 @@ class Job:
             ia_upload(self.archive["keys"], ident, path, meta,
                       "audio" if audio else "movies", progress, self.cancel,
                       on_status=lambda t: self.ui.progress(None, t), topics=topics)
-            self.uploaded += 1
+            self._count("uploaded")
             self.ui.log("Uploaded: " + page + ("  (TRIAL: deleted after about 30 days)" if a.get("trial")
                                                else "  (can take a few minutes to show up)"), "ok")
             self.ui.log("   Topics: " + ", ".join(topics))
             if a.get("extras"):
                 self._upload_extras(ident, path, meta, "audio" if audio else "movies", entry, vid, topics)
+            return True
         except Cancelled:
             raise
         except IAError as exc:
@@ -3813,6 +4422,130 @@ class Job:
                             "downloaded. Upload them later with Upload files...", "err")
         except Exception as exc:
             self.failed.append(("archive.org upload of " + path.name, str(exc)[:300] or "Unknown error"))
+
+    # --- running downloads and uploads at the same time ---
+    UPLOAD_QUEUE_MAX = 2        # downloads may run at most this far ahead of the uploads
+
+    def _count(self, name, n=1):
+        with self._lock:
+            setattr(self, name, getattr(self, name) + n)
+
+    def _in_cache(self, path):
+        try:
+            Path(path).resolve().relative_to(self.cache_dir.resolve())
+            return True
+        except (ValueError, OSError):
+            return False
+
+    def _archive_and_tidy(self, path, meta, vid, entry):
+        """Upload; with "keep a copy" off, delete the cached file once archive.org has it."""
+        ok = self._archive(path, meta, vid, entry)
+        if ok and vid:
+            self.uploaded_ids.add(vid)
+        if ok and self._in_cache(path):
+            try:
+                Path(path).unlink()
+                self._count("removed")
+            except OSError:
+                pass
+        return ok
+
+    def _upload_worker(self):
+        while True:
+            task = self._uploads.get()
+            try:
+                if task is None or self.cancel.is_set():
+                    return
+                path, meta, vid, entry = task
+                self.ui.upload_now(path.name)
+                self._archive_and_tidy(path, meta, vid, entry)
+            except Cancelled:
+                return
+            except Exception as exc:
+                self.failed.append(("archive.org upload", clean_error(exc)))
+            finally:
+                self._uploads.task_done()
+                self.ui.upload_now("")
+
+    def _queue_upload(self, path, meta, vid, entry):
+        """Hand a saved file to the upload worker, so the next download can start now."""
+        if self._worker is None:
+            self._worker = threading.Thread(target=self._upload_worker, daemon=True, name="va-upload")
+            self._worker.start()
+        if not self._uploads.empty() or self._uploads.unfinished_tasks:
+            self.ui.log(f"   Upload queued: {path.name} (the next download starts meanwhile)")
+        while True:
+            if self.cancel.is_set():
+                raise Cancelled()
+            try:
+                self._uploads.put((path, meta, vid, entry), timeout=0.3)
+                return
+            except queue.Full:
+                self.ui.now("Waiting for an upload to finish before the next download...")
+
+    def _drain_uploads(self):
+        """Wait until every queued upload is done (Stop still works)."""
+        if self._worker is None:
+            return
+        if self._uploads.unfinished_tasks:
+            self.ui.now("Finishing the uploads...")
+        self._uploads.put(None)
+        while self._worker.is_alive():
+            if self.cancel.is_set():
+                raise Cancelled()
+            self._worker.join(0.3)
+        self._worker = None
+
+    def _already_uploaded(self, entry, vid):
+        """With "keep a copy" off: is this video already on archive.org? Then it isn't
+        downloaded at all. Returns the item's page or None."""
+        a = self.archive
+        site = site_key(self._overrides({}, entry)) or site_key(entry) or "youtube"
+        names = item_names(a.get("prefix"), vid, site, self.hide_source, a.get("trial"))
+        try:
+            ident, item, note = pick_item(names, a.get("username"))
+        except Exception:
+            return None
+        if note or not item or item_is_blocked(item):
+            return None
+        want = re.sub(r"[\W_]+", "", str(vid))
+        kinds = self.AUDIO_EXTS if self.mode == "mp3" else self.VIDEO_EXTS
+        for f in item.get("files") or []:
+            m = re.search(r"\[([^\[\]]+)\]\.(\w+)$", str(f.get("name") or ""))
+            if m and re.sub(r"[\W_]+", "", m.group(1)) == want and m.group(2).lower() in kinds:
+                if a.get("refresh_topics"):
+                    self._refresh_item(ident, item, None, entry, vid, Path(f"{f['name']}"))
+                return "https://archive.org/details/" + ident
+        return None
+
+    def _move_leftovers(self):
+        """Files from the upload cache that didn't get uploaded go to your folder, so
+        nothing is lost and "Upload files..." can upload them later."""
+        if not self.cache_dir.is_dir():
+            return
+        for f in sorted(self.cache_dir.rglob("*")):
+            if not f.is_file():
+                continue
+            dest = self.out_dir / f.parent.relative_to(self.cache_dir)   # keeps playlist folders
+            target, n = dest / f.name, 1
+            while target.exists():
+                target = dest / f"{f.stem} ({n}){f.suffix}"
+                n += 1
+            try:
+                dest.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(f), str(target))
+                self.ui.log(f"Not uploaded, so kept in your folder: {target.relative_to(self.out_dir)}", "warn")
+            except OSError:
+                pass
+        for d in sorted((d for d in self.cache_dir.rglob("*") if d.is_dir()), key=lambda d: -len(d.parts)):
+            try:
+                d.rmdir()
+            except OSError:
+                pass
+        try:
+            self.cache_dir.rmdir()
+        except OSError:
+            pass
 
     def _upload_files(self):
         """Upload files that were downloaded earlier, exactly like a fresh download's."""
@@ -3872,6 +4605,8 @@ class Job:
                 except Exception as exc:
                     self.failed.append((url, clean_error(exc)))
                     continue
+                if opts.get("folder") and title is None:
+                    title = opts["folder"]
                 for n, entry in enumerate(items, 1):
                     try:
                         self._do_video(entry, title, n, len(items))
@@ -3880,15 +4615,52 @@ class Job:
                     except Exception as exc:
                         label = entry.get("title") or entry.get("url") or url
                         self.failed.append((label, clean_error(exc)))
+            self._drain_uploads()
             self._review_blocked()
         except Cancelled:
             self.cancelled = True
         finally:
+            if self._worker is not None:          # Stop: let the upload worker end, then tidy up
+                self.cancel.set()
+                self._worker.join(30)
+            self._move_leftovers()
             _rmtree_retry(self.staging.parent)
             TOOL_LOCK.release()
 
+    def ok_ids(self):
+        """Videos that are done: saved (or already there) and, when uploading, on archive.org."""
+        return set(self.done_ids) & set(self.uploaded_ids) if self.archive else set(self.done_ids)
+
+    def list_videos(self, url, limit):
+        """(title, [{"id", "url", "title", "live_status"}]) of a channel/playlist, newest first.
+        Only the list is read, no video pages, so it's quick."""
+        out = []
+        code, errors = self._run(["-J", "--flat-playlist", "--yes-playlist", "-I", f"1:{limit}", "--", url],
+                                 lambda line: out.append(line) if line.startswith("{") else None)
+        if not out:
+            raise self._failure(code, errors)
+        info = json.loads(out[-1])
+        if info.get("_type") not in ("playlist", "multi_video"):
+            return info.get("title") or url, [info]
+        entries = []
+        for e in info.get("entries") or []:
+            if not e:
+                continue
+            if e.get("_type") == "playlist" and e.get("entries"):   # a tab inside a channel
+                entries += [x for x in e["entries"] if x]
+            else:
+                entries.append(e)
+        title = info.get("channel") or info.get("uploader") or info.get("title") or url
+        title = re.sub(r"\s+-\s+(Videos|Shorts|Live|Streams)$", "", str(title))
+        keep = ("id", "url", "webpage_url", "title", "live_status", "is_live", "ie_key", "extractor_key")
+        return title, [{k: e[k] for k in keep if e.get(k) is not None} for e in entries if e.get("id")]
+
     def summary(self):
         parts = [] if self.files is not None else [f"{self.saved} saved"]
+        if self.removed:
+            parts.append(f"{self.removed} deleted after upload")
+        if self.not_downloaded:
+            parts.append(f"{self.not_downloaded} not downloaded (already on archive.org)")
         if self.existing:
             parts.append(f"{self.existing} already in folder")
         if self.uploaded:
@@ -3922,6 +4694,12 @@ class GuiUI:
 
     def progress(self, pct, detail):
         self.events.put(("progress", pct, detail))
+
+    def upload_progress(self, pct, detail):
+        self.events.put(("upload_progress", pct, detail))
+
+    def upload_now(self, name):
+        self.events.put(("upload_now", name))
 
     def review_blocked(self, items):
         answered, box = threading.Event(), {}
@@ -3963,9 +4741,40 @@ def run_gui():
         pass  # the exe's own icon is still used
     if not acquire_single_instance():
         root.withdraw()
-        messagebox.showinfo(APP_NAME, f"{APP_NAME} is already open.")
+        if "--check-followed" not in sys.argv[1:]:   # the daily task stays quiet if you have it open
+            messagebox.showinfo(APP_NAME, f"{APP_NAME} is already open.")
         root.destroy()
         return
+    if (sys.platform == "win32" and not running_installed() and "--portable" not in sys.argv[1:]
+            and "--check-followed" not in sys.argv[1:]):
+        # a downloaded exe: offer to install it (once installed, it starts from there)
+        root.withdraw()
+        answer = messagebox.askyesnocancel(
+            f"Install {APP_NAME} {APP_VERSION}",
+            f"Install {APP_NAME} on this PC?\n\n"
+            "Yes: install it (or update the installed one) with Start menu and desktop shortcuts, "
+            "then start it. You can delete this downloaded file afterwards.\n\n"
+            "No: just run it from here this time.")
+        if answer is None:
+            root.destroy()
+            return
+        if answer:
+            try:
+                install_app(Path(sys.executable))
+            except OSError as exc:
+                messagebox.showerror(APP_NAME, f"Couldn't install: {exc}\n\nIs the installed "
+                                     f"{APP_NAME} still open? Close it and try again.")
+                root.destroy()
+                return
+            release_single_instance()
+            try:
+                subprocess.Popen([str(INSTALL_EXE)], close_fds=True)
+            except OSError as exc:
+                messagebox.showerror(APP_NAME, f"Installed, but couldn't start it: {exc}\n"
+                                     "Start it from the desktop shortcut.")
+            root.destroy()
+            return
+        root.deiconify()
     scale = max(root.winfo_fpixels("1i") / 96, 1.0)
 
     def px(n):
@@ -4077,14 +4886,54 @@ def run_gui():
 
     body = tk.Frame(root, bg=FACE, padx=px(10), pady=px(8))
     body.pack(fill="both", expand=True)
-    body.columnconfigure(0, weight=1)
+
+    # Three parts with draggable dividers between them: the links, the settings (steps 2-4,
+    # scrolls when made small) and progress + activity log (gets any extra room).
+    panes = tk.PanedWindow(body, orient="vertical", bg=FACE, bd=0, sashwidth=px(8),
+                           sashrelief="raised", sashpad=px(2), opaqueresize=True)
+    panes.pack(fill="both", expand=True)
+    pane_links = tk.Frame(panes, bg=FACE)
+    pane_links.columnconfigure(0, weight=1)
+    pane_links.rowconfigure(0, weight=1)
+    pane_mid = tk.Frame(panes, bg=FACE)
+    mid_canvas = tk.Canvas(pane_mid, bg=FACE, highlightthickness=0, bd=0)
+    mid_scroll = tk.Scrollbar(pane_mid, orient="vertical", command=mid_canvas.yview)
+    mid = tk.Frame(mid_canvas, bg=FACE)
+    mid.columnconfigure(0, weight=1)
+    mid_item = mid_canvas.create_window(0, 0, window=mid, anchor="nw")
+
+    def mid_yscroll(first, last):
+        mid_scroll.set(first, last)
+        if float(first) <= 0 and float(last) >= 1:
+            mid_scroll.pack_forget()
+        elif not mid_scroll.winfo_ismapped():
+            mid_scroll.pack(side="right", fill="y", before=mid_canvas)
+    mid_canvas.configure(yscrollcommand=mid_yscroll)
+    mid_canvas.pack(side="left", fill="both", expand=True)
+    mid.bind("<Configure>", lambda e: mid_canvas.configure(scrollregion=(0, 0, e.width, e.height)))
+    mid_canvas.bind("<Configure>", lambda e: mid_canvas.itemconfigure(mid_item, width=e.width))
+    pane_run = tk.Frame(panes, bg=FACE)
+    pane_run.columnconfigure(0, weight=1)
+
+    def wheel(event):
+        """The mouse wheel scrolls the settings when the pointer is over them."""
+        w = root.winfo_containing(event.x_root, event.y_root)
+        if w is None or not str(w).startswith(str(mid_canvas)) or w.winfo_class() in ("Text", "Listbox", "TCombobox"):
+            return
+        if mid_scroll.winfo_ismapped():
+            step = -1 if (getattr(event, "delta", 0) > 0 or event.num == 4) else 1
+            mid_canvas.yview_scroll(step, "units")
+    root.bind_all("<MouseWheel>", wheel, add="+")
+    root.bind_all("<Button-4>", wheel, add="+")
+    root.bind_all("<Button-5>", wheel, add="+")
 
     # ---- step 1: links ----
-    g1 = group(body, "Step 1: Paste your links: YouTube, TikTok, Vimeo, SoundCloud... (one per line)")
+    g1 = group(pane_links, "Step 1: Paste your links: YouTube, TikTok, Vimeo, SoundCloud... (one per line)")
     g1.grid(row=0, column=0, sticky="nsew")
     g1.columnconfigure(0, weight=1)
+    g1.rowconfigure(1, weight=1)
     links = tk.Text(g1, height=4, wrap="none", padx=px(4), pady=px(3), **field)
-    links.grid(row=0, column=0, rowspan=2, sticky="nsew")
+    links.grid(row=0, column=0, rowspan=3, sticky="nsew")
 
     def paste():
         try:
@@ -4098,13 +4947,16 @@ def run_gui():
     h.grid(row=0, column=1, sticky="n", padx=(px(8), 0))
     h, _ = button(g1, "Clear", lambda: links.delete("1.0", "end"), width=8)
     h.grid(row=1, column=1, sticky="n", padx=(px(8), 0), pady=(px(4), 0))
+    h, _ = button(g1, "Channels...", lambda: follow_dialog(), width=8)
+    h.grid(row=2, column=1, sticky="n", padx=(px(8), 0), pady=(px(4), 0))
 
     # ---- step 2: format ----
-    g2 = group(body, "Step 2: Choose a format")
+    g2 = group(mid, "Step 2: Choose a format")
     g2.grid(row=1, column=0, sticky="ew", pady=(px(8), 0))
     mode = tk.StringVar(value=settings.get("mode", "mp3"))
     quality = tk.StringVar()
     playlist = tk.BooleanVar(value=False)
+    original = tk.BooleanVar(value=bool(settings.get("original", False)))
     radio = dict(bg=FACE, activebackground=FACE, selectcolor=WHITE, highlightthickness=0, font=F)
 
     top = tk.Frame(g2, bg=FACE)
@@ -4113,7 +4965,10 @@ def run_gui():
     hint = label(g2, wraplength=px(440))
 
     def update_hint(*_):
-        if mode.get() == "mp3":
+        quality_box.configure(state="disabled" if (original.get() and mode.get() == "mp3") else "readonly")
+        if original.get():
+            hint.configure(text=ORIGINAL_HINT_AUDIO if mode.get() == "mp3" else ORIGINAL_HINT_VIDEO, fg=BLACK)
+        elif mode.get() == "mp3":
             hint.configure(text=MP3_HINT, fg=BLACK)
         else:
             uhd = MP4_QUALITIES.get(quality.get(), 1080) > 1080
@@ -4138,6 +4993,10 @@ def run_gui():
     label(top, "Quality:").pack(side="left", padx=(0, px(6)))
     quality_box.pack(side="left")
     quality_box.bind("<<ComboboxSelected>>", on_quality_change)
+    tk.Checkbutton(g2, text="Original quality: keep the best audio and video exactly as the site has them "
+                   "(no conversion; best for ASMR)", variable=original,
+                   command=lambda: (save_settings(original=original.get()), update_hint()),
+                   **radio).pack(anchor="w", pady=(px(4), 0))
     hint.pack(fill="x", pady=(px(6), 0))
     tk.Checkbutton(g2, text="If a link is a playlist, download all of it "
                    f"(asks first above {PLAYLIST_CONFIRM_OVER} videos)",
@@ -4145,7 +5004,7 @@ def run_gui():
     on_mode_change()
 
     # ---- step 3: folder ----
-    g3 = group(body, "Step 3: Save to")
+    g3 = group(mid, "Step 3: Save to")
     g3.grid(row=2, column=0, sticky="ew", pady=(px(8), 0))
     g3.columnconfigure(0, weight=1)
     out_dir = tk.StringVar(value=settings.get("out_dir") or str(DEFAULT_OUT))
@@ -4204,7 +5063,7 @@ def run_gui():
         h.grid(row=0, column=col, padx=(px(6), 0))
 
     # ---- step 4: archive.org ----
-    ga = group(body, "Step 4: Author, topics and archive.org (optional)")
+    ga = group(mid, "Step 4: Author, topics and archive.org (optional)")
     ga.grid(row=3, column=0, sticky="ew", pady=(px(8), 0))
     ga.columnconfigure(0, weight=1)
     upload = tk.BooleanVar(value=bool(settings.get("ia_upload")) and load_ia_keys() is not None)
@@ -4297,6 +5156,11 @@ def run_gui():
     lic_box.pack(side="left", padx=(px(6), px(8)))
     lic_box.bind("<<ComboboxSelected>>", lambda e: save_settings(ia_license=license_var.get()))
     label(lic_row, "Only pick a license for videos you hold the rights to.", fg=SHADOW).pack(side="left")
+    keep_local = tk.BooleanVar(value=settings.get("keep_local", True))
+    tk.Checkbutton(ga, text="Keep a copy on this PC (untick to only upload: each file is deleted once it's on archive.org)",
+                   variable=keep_local, **radio,
+                   command=lambda: save_settings(keep_local=keep_local.get())).grid(
+        row=8, column=0, columnspan=2, sticky="w", pady=(px(4), 0))
 
     def ia_dialog(enable_after=False):
         dlg = tk.Toplevel(root)
@@ -4416,8 +5280,8 @@ def run_gui():
     refresh_ia_status()
 
     # ---- step 5: go ----
-    actions = tk.Frame(body, bg=FACE)
-    actions.grid(row=4, column=0, sticky="ew", pady=(px(10), 0))
+    actions = tk.Frame(pane_run, bg=FACE)        # always visible, however small the settings are
+    actions.grid(row=4, column=0, sticky="ew", pady=(px(4), 0))
     go_holder, go = button(actions, "Download", None, width=14, default=True)
     go_holder.pack(side="left")
     stop_holder, stop = button(actions, "Stop", None, width=8)
@@ -4427,7 +5291,7 @@ def run_gui():
     stop.configure(state="disabled")
 
     # ---- progress ----
-    g4 = group(body, "Progress")
+    g4 = group(pane_run, "Progress")
     g4.grid(row=5, column=0, sticky="ew", pady=(px(8), 0))
     now = label(g4, "Getting ready...", font=FB)
     now.pack(fill="x")
@@ -4435,11 +5299,24 @@ def run_gui():
     bar.pack(fill="x", pady=(px(4), px(3)))
     detail = label(g4, " ")
     detail.pack(fill="x")
+    up_frame = tk.Frame(g4, bg=FACE)          # shown while an upload runs next to a download
+    up_name = label(up_frame, " ", font=FB)
+    up_name.pack(fill="x", pady=(px(6), 0))
+    up_bar = BlockBar(up_frame)
+    up_bar.pack(fill="x", pady=(px(3), px(3)))
+    up_detail = label(up_frame, " ")
+    up_detail.pack(fill="x")
 
     # ---- activity log: a little DOS box ----
-    g5 = group(body, "Activity log")
+    g5 = group(pane_run, "Activity log")
     g5.grid(row=6, column=0, sticky="nsew", pady=(px(8), 0))
-    body.rowconfigure(6, weight=1)
+    pane_run.rowconfigure(6, weight=1)
+    # each part starts at its natural height; extra window height goes to the activity log
+    mid.update_idletasks()
+    mid_canvas.configure(height=mid.winfo_reqheight(), width=mid.winfo_reqwidth())
+    panes.add(pane_links, minsize=px(70), stretch="never")
+    panes.add(pane_mid, minsize=px(60), stretch="never")
+    panes.add(pane_run, minsize=px(150), stretch="always")
     log = tk.Text(g5, height=7, bg=LOG_BG, fg=LOG_FG, font=FMONO, relief="sunken", bd=2,
                   highlightthickness=0, padx=px(6), pady=px(4), state="disabled", wrap="word",
                   selectbackground=FACE, selectforeground=BLACK, insertbackground=LOG_FG)
@@ -4634,10 +5511,12 @@ def run_gui():
         dlg.bind("<Escape>", lambda e: close())
         show("Press Scan to look for downloaded files that aren't on archive.org yet.")
 
-    def start():
+    def start(lines=None, after=None):
+        """Start a run with the links in Step 1, or with `lines` (followed channels).
+        after(job) is called once that run has finished. True if it started."""
         if state["job"] is not None or not state["ready"]:
-            return
-        urls = [u.strip() for u in links.get("1.0", "end").splitlines() if u.strip()]
+            return False
+        urls = lines if lines is not None else [u.strip() for u in links.get("1.0", "end").splitlines() if u.strip()]
         if not urls:
             now.configure(text="Paste at least one link first (Step 1).")
             links.focus_set()
@@ -4654,14 +5533,20 @@ def run_gui():
         m = mode.get()
         q = (MP3_QUALITIES if m == "mp3" else MP4_QUALITIES)[quality.get()]
         job = Job(urls, m, q, out_dir.get().strip(), playlist.get(), GuiUI(events), cookies=cookie_args(),
-                  archive=archive, author=author_var.get().strip(), hide_source=hide_source.get())
+                  archive=archive, author=author_var.get().strip(), hide_source=hide_source.get(),
+                  keep_local=keep_local.get() or not archive, original=original.get())
         state["job"] = job
+        state["after_job"] = after
         set_busy(True)
         bar.set(0)
         status_left.configure(text="Working...")
-        write_log(f"Starting {len(urls)} link(s) as {m.upper()}, {quality.get()}"
-                  + (", uploading to archive.org" if archive else ""))
+        what = (("original audio" if m == "mp3" else f"original quality (MKV), up to {quality.get()}")
+                if original.get() else f"{m.upper()}, {quality.get()}")
+        write_log(f"Starting {len(urls)} link(s) as {what}"
+                  + ((", uploading to archive.org" + ("" if keep_local.get() else ", not keeping copies"))
+                     if archive else ""))
         threading.Thread(target=worker, args=(job,), daemon=True).start()
+        return True
 
     def cancel():
         job = state["job"]
@@ -4670,10 +5555,11 @@ def run_gui():
             stop.configure(state="disabled")
             now.configure(text="Stopping...")
 
-    go.configure(command=start)
+    go.configure(command=lambda: start())
     stop.configure(command=cancel)
 
     def on_close():
+        save_layout()
         if state["job"] is None:
             root.destroy()
             return
@@ -4684,6 +5570,374 @@ def run_gui():
             now.configure(text="Stopping, then closing...")
 
     root.protocol("WM_DELETE_WINDOW", on_close)
+
+    # ---- followed channels ----
+    follow_state = {"busy": False, "auto_close": False, "dialog": None, "refresh": None}
+
+    def in_bg(task, done):
+        """Run task() in a thread holding the tools lock; done(result, error) in the window."""
+        if not TOOL_LOCK.acquire(blocking=False):
+            done(None, "busy")
+            return
+        result = {}
+
+        def work():
+            try:
+                result["value"] = task()
+            except Exception as exc:
+                result["error"] = clean_error(exc)
+            finally:
+                TOOL_LOCK.release()
+        threading.Thread(target=work, daemon=True).start()
+
+        def wait():
+            if not result:
+                root.after(150, wait)
+                return
+            done(result.get("value"), result.get("error"))
+        wait()
+
+    class QuietUI:
+        """For reading channel lists in the background: only problems reach the log."""
+        def log(self, text, tag=None):
+            events.put(("log", text, tag))
+
+        def now(self, text):
+            pass
+
+        def progress(self, pct, detail):
+            pass
+
+        def confirm(self, q, title=None):
+            return False
+
+    def lister():
+        return Job([], "mp4", 0, out_dir.get().strip() or str(DEFAULT_OUT), True, QuietUI(),
+                   cookies=cookie_args())
+
+    def follow_finished(job, plan):
+        """After the run: what worked counts as seen, so it isn't fetched again."""
+        ok, data = job.ok_ids(), load_follows()
+        done_n = later_n = 0
+        for url, ids in plan.items():
+            ch = follow_find(data, url)
+            if ch is None:
+                continue
+            gave_up = follow_record(ch, ids, ok)
+            done_n += len([i for i in ids if i in ok])
+            later_n += len([i for i in ids if i not in ok and i not in gave_up])
+            for vid in gave_up:
+                write_log(f"Followed channels: gave up on video {vid} of \"{ch.get('title')}\" after "
+                          f"{FOLLOW_GIVE_UP} tries (members-only, removed or blocked?).", "warn")
+        save_follows(data)
+        if job.cancelled:
+            write_log("Followed channels: stopped. What didn't finish is fetched next time.", "warn")
+        write_log(f"Followed channels: {done_n} new video(s) done"
+                  + (f", {later_n} will be tried again next time." if later_n else "."),
+                  "warn" if later_n else "ok")
+        if follow_state["refresh"]:
+            follow_state["refresh"]()
+        maybe_auto_close()
+
+    def maybe_auto_close():
+        """Started by the daily task and nobody opened the window: close when done."""
+        if follow_state["auto_close"] and state["job"] is None and root.state() == "iconic":
+            root.after(1500, on_close)
+
+    def check_followed(auto=False, only=None, tries=0, first=False):
+        """Look for new videos on every followed channel (or only `only`) and download them
+        with the current Step 2-4 settings."""
+        data = load_follows()
+        chans = [c for c in data["channels"] if only is None or c.get("url") == only]
+        if not chans:
+            if not auto:
+                write_log("Followed channels: you don't follow any channel yet (Step 1 > Channels...).", "warn")
+            maybe_auto_close()
+            return
+        if follow_state["busy"] or state["job"] is not None or not state["ready"]:
+            if auto and tries < 40:          # busy, or still starting up: try again a bit later
+                root.after(60000 if state["ready"] else 3000, lambda: check_followed(auto, only, tries + 1, first))
+            elif not auto:
+                write_log("Followed channels: busy right now. Check again when the current run has finished.",
+                          "warn")
+            return
+        follow_state["busy"] = True
+        write_log(f"Followed channels: looking for new videos on {len(chans)} channel(s)...")
+        now.configure(text="Looking for new videos on followed channels...")
+
+        def task():
+            job, found, problems = lister(), [], []
+            for ch in chans:
+                try:
+                    title, entries = job.list_videos(ch["url"], FOLLOW_FIRST_LIMIT if first else FOLLOW_CHECK_LIMIT)
+                    found.append((ch["url"], title, entries))
+                except Exception as exc:
+                    problems.append((ch.get("title") or ch["url"], clean_error(exc)))
+            return found, problems
+
+        def done(value, error):
+            follow_state["busy"] = False
+            now.configure(text=" ")
+            if error:
+                if error == "busy" and auto and tries < 40:
+                    root.after(60000, lambda: check_followed(auto, only, tries + 1, first))
+                else:
+                    write_log(f"Followed channels: couldn't check ({error}).", "err")
+                    maybe_auto_close()
+                return
+            found, problems = value
+            for name, text in problems:
+                write_log(f"Followed channels: couldn't read \"{name}\": {text}", "err")
+            data = load_follows()
+            data["last_check"] = time.time()
+            lines, plan = [], {}
+            for url, title, entries in found:
+                ch = follow_find(data, url)
+                if ch is None:
+                    continue
+                ch["title"] = title or ch.get("title")
+                ch["checked"] = time.strftime("%Y-%m-%d %H:%M")
+                new = follow_new(ch, entries)
+                ch["last_new"] = len(new)
+                if new:
+                    write_log(f"   {ch['title']}: {len(new)} new video(s)")
+                    lines += [follow_line(ch, e) for e in new]
+                    plan[url] = [e["id"] for e in new]
+            save_follows(data)
+            if follow_state["refresh"]:
+                follow_state["refresh"]()
+            if not lines:
+                write_log("Followed channels: no new videos.", "ok")
+                maybe_auto_close()
+                return
+            if not start(lines, after=lambda job: follow_finished(job, plan)):
+                write_log("Followed channels: couldn't start (see above). They're fetched next time.", "warn")
+                maybe_auto_close()
+        in_bg(task, done)
+
+    def follow_dialog():
+        if follow_state["dialog"] is not None and follow_state["dialog"].winfo_exists():
+            follow_state["dialog"].lift()
+            return
+        dlg = tk.Toplevel(root)
+        follow_state["dialog"] = dlg
+        dlg.title("Followed channels")
+        dlg.configure(bg=FACE)
+        dlg.transient(root)
+        frm = tk.Frame(dlg, bg=FACE, padx=px(12), pady=px(10))
+        frm.pack(fill="both", expand=True)
+        frm.columnconfigure(0, weight=1)
+        frm.rowconfigure(3, weight=1)
+        label(frm, "Follow a channel, playlist or profile, and Video Archiver fetches only the videos that "
+                   "are new since last time, with your Step 2-4 settings (format, folder, archive.org). "
+                   "Each channel gets its own folder.", wraplength=px(470)).grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        url_var = tk.StringVar()
+        entry = tk.Entry(frm, textvariable=url_var, width=50, **field)
+        entry.grid(row=1, column=0, sticky="ew", pady=(px(8), 0), ipady=px(1))
+        h, follow_b = button(frm, "Follow", lambda: add(), width=10, default=True)
+        h.grid(row=1, column=1, sticky="e", padx=(px(6), 0), pady=(px(8), 0))
+        msg = label(frm, "For YouTube, paste the channel link (youtube.com/@name).", fg=SHADOW,
+                    wraplength=px(470))
+        msg.grid(row=2, column=0, columnspan=2, sticky="w", pady=(px(2), px(6)))
+        box = tk.Listbox(frm, height=8, width=70, bg=WHITE, fg=BLACK, relief="sunken", bd=2,
+                         highlightthickness=0, font=F, selectbackground=NAVY, selectforeground=WHITE,
+                         exportselection=False, activestyle="none")
+        box.grid(row=3, column=0, columnspan=2, sticky="nsew")
+        row = tk.Frame(frm, bg=FACE)
+        row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(px(6), 0))
+        h, _ = button(row, "Check all now", lambda: check_all(), width=14)
+        h.pack(side="left")
+        h, _ = button(row, "Check selected", lambda: check_one(), width=14)
+        h.pack(side="left", padx=(px(6), 0))
+        h, _ = button(row, "Unfollow", lambda: remove(), width=10)
+        h.pack(side="right")
+
+        opts = group(frm, "Automatic checks")
+        opts.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(px(8), 0))
+        st = load_settings()
+        on_start = tk.BooleanVar(value=bool(st.get("follow_on_start", False)))
+        every = tk.StringVar(value=st.get("follow_every") if st.get("follow_every") in FOLLOW_EVERY else "Never")
+        daily = tk.BooleanVar(value=bool(st.get("follow_daily", False)))
+        daily_at = tk.StringVar(value=st.get("follow_daily_at", "18:00"))
+        chk = dict(bg=FACE, activebackground=FACE, selectcolor=WHITE, highlightthickness=0, font=F)
+        tk.Checkbutton(opts, text="Check when Video Archiver opens", variable=on_start,
+                       command=lambda: save_settings(follow_on_start=on_start.get()), **chk).grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        label(opts, "While it's open, check every:").grid(row=1, column=0, sticky="w")
+        ev_box = ttk.Combobox(opts, textvariable=every, state="readonly", width=10, font=F,
+                              values=list(FOLLOW_EVERY))
+        ev_box.grid(row=1, column=1, sticky="w", padx=(px(6), 0), pady=px(2))
+        ev_box.bind("<<ComboboxSelected>>", lambda e: save_settings(follow_every=every.get()))
+        daily_cb = tk.Checkbutton(opts, text="Also check once a day while it's closed, at", variable=daily,
+                                  command=lambda: set_daily(), **chk)
+        daily_cb.grid(row=2, column=0, sticky="w")
+        at_box = ttk.Combobox(opts, textvariable=daily_at, state="readonly", width=6, font=F,
+                              values=[f"{hour:02d}:00" for hour in range(24)])
+        at_box.grid(row=2, column=1, sticky="w", padx=(px(6), 0), pady=px(2))
+        at_box.bind("<<ComboboxSelected>>", lambda e: set_daily() if daily.get()
+                    else save_settings(follow_daily_at=daily_at.get()))
+        label(opts, "Windows starts Video Archiver minimized, fetches the new videos, then closes it. "
+                    "The PC has to be on and you signed in.", fg=SHADOW, wraplength=px(450)).grid(
+            row=3, column=0, columnspan=2, sticky="w")
+        if sys.platform != "win32":
+            daily_cb.configure(state="disabled")
+        h, _ = button(frm, "Close", dlg.destroy, width=10)
+        h.grid(row=6, column=1, sticky="e", pady=(px(8), 0))
+
+        def say(text, bad=False):
+            if dlg.winfo_exists():
+                msg.configure(text=text, fg=MAROON if bad else BLACK)
+
+        def set_daily():
+            err = set_daily_task(daily.get(), daily_at.get())
+            if err:
+                daily.set(False)
+                say("Couldn't set up the daily check: " + err, True)
+            else:
+                say(f"Daily check at {daily_at.get()} is on." if daily.get() else "Daily check is off.")
+            save_settings(follow_daily=daily.get(), follow_daily_at=daily_at.get())
+
+        def refresh():
+            if not dlg.winfo_exists():
+                follow_state["refresh"] = None
+                return
+            sel = box.curselection()
+            box.delete(0, "end")
+            for ch in load_follows()["channels"]:
+                info = f"{len(ch.get('seen') or [])} known"
+                if ch.get("checked"):
+                    info += f", checked {ch['checked']}"
+                if ch.get("fails"):
+                    info += f", {len(ch['fails'])} to retry"
+                box.insert("end", f"{ch.get('title') or ch['url']}   ({info})")
+            if sel and sel[0] < box.size():
+                box.selection_set(sel[0])
+        follow_state["refresh"] = refresh
+        refresh()
+
+        def selected():
+            sel = box.curselection()
+            chans = load_follows()["channels"]
+            return chans[sel[0]] if sel and sel[0] < len(chans) else None
+
+        def check_all():
+            say("Checking... see the activity log.")
+            check_followed()
+
+        def check_one():
+            ch = selected()
+            if ch is None:
+                say("Click a channel in the list first.", True)
+                return
+            say("Checking... see the activity log.")
+            check_followed(only=ch["url"])
+
+        def remove():
+            ch = selected()
+            if ch is None:
+                say("Click a channel in the list first.", True)
+                return
+            if not messagebox.askyesno("Unfollow", f"Stop following \"{ch.get('title') or ch['url']}\"?\n\n"
+                                       "Videos you already have stay where they are.", parent=dlg):
+                return
+            data = load_follows()
+            data["channels"] = [c for c in data["channels"] if c.get("url") != ch["url"]]
+            save_follows(data)
+            refresh()
+
+        def add():
+            url = url_var.get().strip()
+            if not re.match(r"https?://\S+$", url):
+                say("Paste the link of a channel, playlist or profile first.", True)
+                return
+            if follow_find(load_follows(), url):
+                say("You already follow that one.", True)
+                return
+            if not state["ready"] or state["job"] is not None or follow_state["busy"]:
+                say("Busy right now: try again when the current run has finished.", True)
+                return
+            follow_b.configure(state="disabled")
+            follow_state["busy"] = True
+            say("Reading the channel's video list (big channels take a minute)...")
+
+            def task():
+                return lister().list_videos(channel_url(url), FOLLOW_FIRST_LIMIT)
+
+            def done(value, error):
+                follow_state["busy"] = False
+                if not dlg.winfo_exists():
+                    return
+                follow_b.configure(state="normal")
+                if error:
+                    say("Busy right now: try again in a moment." if error == "busy"
+                        else "Couldn't read that link: " + error, True)
+                    return
+                title, entries = value
+                if not entries:
+                    say("That link has no videos (is it a channel, playlist or profile?).", True)
+                    return
+                n = len(entries)
+                more = " (or more)" if n >= FOLLOW_FIRST_LIMIT else ""
+                answer = messagebox.askyesnocancel(
+                    "Follow " + title,
+                    f"\"{title}\" has {n}{more} videos.\n\nDownload the ones that are there now as well?\n\n"
+                    "Yes: all of them, oldest first (this can take a long time).\n"
+                    "No: only videos that come out from now on.", parent=dlg)
+                if answer is None:
+                    say("Not followed.")
+                    return
+                data = load_follows()
+                ch = follow_add(data, url, title, entries, download_existing=answer)
+                save_follows(data)
+                url_var.set("")
+                refresh()
+                write_log(f"Following \"{title}\"" + (": fetching its videos now." if answer
+                                                      else ": new videos from now on."), "ok")
+                say(f"Following \"{title}\".")
+                if answer:
+                    check_all_of = ch["url"]
+                    root.after(200, lambda: check_followed(only=check_all_of, first=True))
+            in_bg(task, done)
+        entry.bind("<Return>", lambda ev: add())
+        entry.focus_set()
+
+    def follow_timer():
+        """'While it's open, check every ...'"""
+        hours = FOLLOW_EVERY.get(load_settings().get("follow_every", "Never"), 0)
+        if hours and time.time() - float(load_follows().get("last_check") or 0) >= hours * 3600:
+            check_followed(auto=True)
+        root.after(60000, follow_timer)
+
+    # ---- resizable layout: remembered between runs ----
+    layout = {"default": None}
+
+    def save_layout():
+        try:
+            if root.state() == "normal":
+                save_settings(layout={"size": [root.winfo_width(), root.winfo_height()],
+                                      "sash": [panes.sash_coord(0)[1], panes.sash_coord(1)[1]]})
+        except (tk.TclError, IndexError):
+            pass
+
+    def place_sashes(y0, y1):
+        total = panes.winfo_height()
+        y0 = max(px(70), min(int(y0), total - px(220)))
+        y1 = max(y0 + px(60), min(int(y1), total - px(150)))
+        panes.sash_place(0, 0, y0)
+        panes.update_idletasks()
+        panes.sash_place(1, 0, y1)
+
+    def bigger_log():
+        """Links and settings as small as they go: most of the window for the activity log."""
+        place_sashes(px(70), px(70) + min(mid.winfo_reqheight(), px(140)))
+
+    def reset_layout():
+        if layout["default"]:
+            w, h, y0, y1 = layout["default"]
+            root.geometry(f"{w}x{h}")
+            root.update_idletasks()
+            place_sashes(y0, y1)
 
     # ---- menu bar ----
     menubar = tk.Menu(root)
@@ -4767,7 +6021,7 @@ def run_gui():
                    "For sites yt-dlp doesn't support. Easiest: Tools > Capture a video's stream address. "
                    "By hand: open the video page, press F12, go to Network, type m3u8 (or mpd) in the filter "
                    "box and play the video. Right-click the request > Copy > Copy URL, and paste it below."),
-            rows=[("url", "Stream address:", url, "Ends in .m3u8 or .mpd (anything after a ? is fine)."),
+            rows=[("url", "Stream address:", url, "Usually ends in .m3u8 or .mpd (anything after a ? is fine)."),
                   ("page", "Page it's on:", page, "Sent along as the Referer; many sites need it."),
                   ("title", "Title:", "", "Optional. Without it, the title comes from the page address.")])
         if not got:
@@ -4785,8 +6039,9 @@ def run_gui():
         write_log("Stream link added to Step 1.", "ok")
 
     def capture_stream(link, parent, done):
-        """Open link in a separate browser window, let the user play the video, then call
-        done(addresses, segments) on the main thread. Returns False if it couldn't start."""
+        """Open link in a separate browser window and show a small always-on-top window
+        with the video addresses found so far. done(addresses, pieces) is called on the main
+        thread when finished; addresses is None if cancelled. Returns False if it can't start."""
         cap = BrowserCapture(link)
         try:
             cap.start()
@@ -4795,41 +6050,169 @@ def run_gui():
                                 parent=parent)
             return False
         write_log(f"Capture: opened {link} in a separate {cap.browser.stem} window.")
-        messagebox.showinfo(
-            "Capture the video's address",
-            "A separate browser window has opened with the video page. It's a fresh, empty profile: "
-            "nothing from your normal browser is used, and it's deleted afterwards.\n\n"
-            "1. Play the video there for about 10 seconds (skip or wait out any ads).\n"
-            "2. If the site needs you to sign in, do that in that window first.\n"
-            "3. Then come back and press OK here. The window closes by itself.",
-            parent=parent)
-        result = {}
+        win = tk.Toplevel(root)
+        win.title("Capturing the video's address")
+        win.configure(bg=FACE)
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        frm = tk.Frame(win, bg=FACE, padx=px(12), pady=px(10))
+        frm.pack(fill="both", expand=True)
+        label(frm, "A separate browser window shows the video page (fresh, empty profile; deleted "
+                   "afterwards).\n\n1. Play the video there. Close or wait out any ads; sign in first if "
+                   "the site needs it.\n2. Let the video itself play for about 10 seconds.\n3. When an address "
+                   "appears below, click \"Use this address\" (mouse only, so pressing Space to play the "
+                   "video can't end this by accident). The top one is usually right; click another "
+                   "line to use that one instead.", wraplength=px(430)).pack(anchor="w")
+        status = label(frm, "Waiting for the video to play...", font=FB, wraplength=px(430))
+        status.pack(anchor="w", pady=(px(8), px(2)))
+        traffic = label(frm, "Browser traffic: starting...", fg=SHADOW)
+        traffic.pack(anchor="w", pady=(0, px(4)))
+        box = tk.Listbox(frm, height=5, width=60, bg=LOG_BG, fg=LOG_FG, font=FMONO, relief="sunken", bd=2,
+                         selectbackground=FACE, selectforeground=BLACK, activestyle="none",
+                         exportselection=False, takefocus=0)
+        box.pack(fill="x")
+        btns = tk.Frame(frm, bg=FACE)
+        btns.pack(fill="x", pady=(px(8), 0))
+        state_ = {"over": False, "shown": [], "chosen": None}
 
-        def work():
-            try:
-                result["value"] = cap.finish()
-            except Exception as exc:
-                result["error"] = str(exc)
-        threading.Thread(target=work, daemon=True).start()
+        def pick(_e=None):
+            sel = box.curselection()
+            if sel and sel[0] < len(state_["shown"]):
+                state_["chosen"] = state_["shown"][sel[0]]
+        box.bind("<<ListboxSelect>>", pick)
 
-        def wait():
-            if not result:
-                root.after(150, wait)
+        def report_empty():
+            """Nothing looked like a video: put what the browser did load in the log."""
+            if not cap.reader.requests:
+                write_log("Capture: the browser's network log stayed empty, so nothing could be read. "
+                          f"Try again; if it stays empty, tell the app's author ({cap.browser.stem} was used).",
+                          "warn")
                 return
-            if "error" in result:
-                write_log(f"Capture failed: {result['error']}", "err")
-                done([], 0)
-            else:
-                found, segments = result["value"]
-                write_log(f"Capture: found {len(found)} video address(es)"
-                          + (f" and {segments} stream pieces." if segments else "."), "ok" if found else "warn")
-                done(found, segments)
-        wait()
+            write_log(f"Capture: no video address among {cap.reader.requests:,} requests"
+                      + (" (only live streams, probably ads)" if cap.reader.found else "")
+                      + ". The biggest loads were:", "warn")
+            for mb, ctype, u in cap.reader.biggest(8):
+                write_log(f"   Big load: {mb} MB, {ctype}: {u[:140]}")
+            write_log("   By type: " + "; ".join(f"{t} {c}x {mb} MB" for t, c, mb in cap.reader.type_summary()))
+            write_log("   (You can send these lines to the app's author; cut out any personal parts of the links.)")
+
+        def end(use):
+            if state_["over"]:
+                return
+            state_["over"] = True
+            status.configure(text="Closing the browser window and reading the rest...")
+            for b in (use_b, cancel_b):
+                b.configure(state="disabled")
+            result = {}
+
+            def work():
+                try:
+                    result["value"] = cap.finish()
+                except Exception as exc:
+                    result["error"] = str(exc)
+            threading.Thread(target=work, daemon=True).start()
+
+            def wait():
+                if not result:
+                    root.after(150, wait)
+                    return
+                try:
+                    win.destroy()
+                except tk.TclError:
+                    pass
+                if "value" in result and (all(cap.reader.is_live(u) for u in result["value"][0])
+                                          and state_["chosen"] not in result["value"][0]):
+                    report_empty()
+                if not use:
+                    write_log("Capture cancelled.")
+                    done(None, 0)
+                elif "error" in result:
+                    write_log(f"Capture failed: {result['error']}", "err")
+                    done([], 0)
+                else:
+                    found, pieces = result["value"]
+                    live = [u for u in found if cap.reader.is_live(u)]
+                    found = [u for u in found if u not in live]      # ads and live streams: never automatic
+                    if state_["chosen"] in live:                     # ...unless you clicked one yourself
+                        found.insert(0, state_["chosen"])
+                    elif state_["chosen"] in found:                  # the line you clicked goes first
+                        found.remove(state_["chosen"])
+                        found.insert(0, state_["chosen"])
+                    capture_state["live_only"] = bool(live) and not found
+                    write_log(f"Capture: found {len(found)} video address(es)"
+                              + (f" and {pieces} stream pieces." if pieces else ".")
+                              + f" The browser made {cap.reader.requests:,} requests.", "ok" if found else "warn")
+                    done(found, pieces)
+            wait()
+
+        def tick():
+            if state_["over"]:
+                return
+            cands = cap.peek()
+            rd = cap.reader
+            mb = rd.media_bytes() / 1048576
+            traffic.configure(text=f"Browser traffic: {rd.requests:,} requests read"
+                                   + (f", {mb:.1f} MB of video loaded" if mb >= 0.1 else ""))
+            waited = time.monotonic() - cap.started
+            if cands:
+                urls = [u for u, _ in cands[:8]]
+                if urls != state_["shown"]:
+                    state_["shown"] = urls
+                    box.delete(0, "end")
+                    for i, (u, n) in enumerate(cands[:8]):
+                        box.insert("end", f"{'>' if i == 0 else ' '} " + ("[LIVE] " if rd.is_live(u) else "")
+                                   + u[:110] + (f"   ({n} pieces)" if n else ""))
+                    if state_["chosen"] in urls:
+                        box.selection_set(urls.index(state_["chosen"]))
+                chosen = state_["chosen"] if state_["chosen"] in urls else urls[0]
+                n = dict(cands).get(chosen, 0)
+                if rd.is_live(chosen):
+                    status.configure(text="So far only live streams ([LIVE]): usually live-cam ads on the page, "
+                                          "not your video. Keep playing the real video. (Click a line only if "
+                                          "you really want that live stream.)")
+                    if state_["chosen"] != chosen:
+                        use_b.configure(state="disabled")
+                        win.after(1000, tick)
+                        return
+                else:
+                    status.configure(text=f"Found {len(cands)} address(es). "
+                                          + ("Using the one you clicked" if chosen != urls[0] else "Using the one marked >")
+                                          + (f" ({n} pieces loaded)." if n else "."))
+                use_b.configure(state="normal")
+            elif waited > 12 and not rd.requests:
+                status.configure(text="The browser isn't reporting any traffic yet. Is the page open in the "
+                                      "new window? If this stays at 0, close that window and try again.")
+            elif waited > 25 and mb >= 1:
+                status.configure(text="Video is loading, but its address isn't recognised yet. Let it play a "
+                                      "little longer; if nothing appears, click Cancel and send the "
+                                      "\"Big load\" lines from the activity log to the app's author.")
+            elif waited > 25:
+                status.configure(text="No video loaded yet. Is the video itself playing (not an ad)?")
+            if not cap.running() and time.monotonic() - cap.started > 5:
+                status.configure(text="The browser window was closed.")
+                end(True)
+                return
+            win.after(1000, tick)
+
+        h, use_b = button(btns, "Use this address", lambda: end(True), width=16, default=True)
+        h.pack(side="left")
+        use_b.configure(state="disabled", takefocus=0)
+        h, cancel_b = button(btns, "Cancel", lambda: end(False), width=8)
+        h.pack(side="right")
+        cancel_b.configure(takefocus=0)
+        win.protocol("WM_DELETE_WINDOW", lambda: end(False))
+        win.after(1000, tick)
         return True
+
+    capture_state = {"live_only": False}
 
     def capture_hint(found, segments):
         if found:
             return None
+        if capture_state.get("live_only"):
+            return ("Only live streams were found, and on most sites those are live-cam ads, not your video, so "
+                    "none was used. The activity log lists what the browser loaded (\"Big load\" lines). "
+                    "If you really want a live stream, capture again and click its line in the list.")
         if segments:
             return ("The browser loaded pieces of a stream but no playlist (.m3u8/.mpd) address. The site may "
                     "build the playlist inside the player, or protect it with DRM; this one can't be captured.")
@@ -4853,6 +6236,8 @@ def run_gui():
             return
 
         def done(found, segments):
+            if found is None:
+                return
             hint = capture_hint(found, segments)
             if hint:
                 messagebox.showinfo("Capture", hint)
@@ -5037,14 +6422,17 @@ def run_gui():
             if not re.match(r"https?://\S+$", link):
                 show("Paste the link of one video page first.")
                 return
-            show("A separate browser window is opening. Play the video there, then press OK in the "
-                 "message that appears.\n")
+            show("A separate browser window is opening. Play the video there; the small \"Capturing\" "
+                 "window shows what it finds.\n")
             cap_b.configure(state="disabled")
 
             def done(found, segments):
                 if not dlg.winfo_exists():
                     return
                 cap_b.configure(state="normal")
+                if found is None:
+                    show("Capture cancelled.")
+                    return
                 hint = capture_hint(found, segments)
                 if hint:
                     show(hint)
@@ -5332,6 +6720,7 @@ def run_gui():
     m_tools.add_cascade(label="yt-dlp channel", menu=m_channel)
     m_tools.add_command(label="Update Deno now", command=lambda: tool_task("deno"))
     m_tools.add_separator()
+    m_tools.add_command(label="Followed channels...", command=lambda: follow_dialog())
     m_tools.add_command(label="Upload downloaded files to archive.org...", command=folder_upload_dialog)
     m_tools.add_separator()
     m_tools.add_command(label="Check a site or link...", command=site_check_dialog)
@@ -5373,6 +6762,12 @@ def run_gui():
     menubar.add_cascade(label="File", underline=0, menu=m_file)
     menubar.add_cascade(label="Options", underline=0, menu=m_opts)
     menubar.add_cascade(label="Tools", underline=0, menu=m_tools)
+    m_view = tk.Menu(menubar, tearoff=0)
+    m_view.add_command(label="Make the activity log bigger", command=bigger_log)
+    m_view.add_command(label="Reset the layout", command=reset_layout)
+    m_view.add_separator()
+    m_view.add_command(label="Tip: drag the bars between the parts to resize them", state="disabled")
+    menubar.add_cascade(label="View", underline=0, menu=m_view)
     menubar.add_cascade(label="Help", underline=0, menu=m_help)
     root.config(menu=menubar)
 
@@ -5434,6 +6829,18 @@ def run_gui():
                     if ev[1] is not None:
                         bar.set(ev[1])
                     detail.configure(text=ev[2] or " ")
+                elif kind == "upload_progress":
+                    if ev[1] is not None:
+                        up_bar.set(ev[1])
+                    up_detail.configure(text=ev[2] or " ")
+                elif kind == "upload_now":
+                    if ev[1]:
+                        up_name.configure(text=("Uploading: " + ev[1])[:90])
+                        up_bar.set(0)
+                        up_detail.configure(text=" ")
+                        up_frame.pack(fill="x")
+                    else:
+                        up_frame.pack_forget()
                 elif kind == "now":
                     now.configure(text=ev[1][:90])
                 elif kind == "log":
@@ -5462,9 +6869,16 @@ def run_gui():
                     now.configure(text=summary)
                     status_left.configure(text=summary)
                     detail.configure(text=" ")
+                    up_frame.pack_forget()
                     bar.set(100 if (job.saved or job.uploaded) and not job.failed and not job.cancelled else 0)
                     state["job"] = None
                     set_busy(False)
+                    after = state.pop("after_job", None)
+                    if after:
+                        try:
+                            after(job)
+                        except Exception as exc:
+                            write_log(f"Followed channels: couldn't save the results ({exc}).", "err")
                     if state["closing"]:
                         root.destroy()
                         return
@@ -5567,14 +6981,42 @@ def run_gui():
         write_log(migration_note, "ok" if migration_note.startswith(("Moved", "Copied")) else "warn")
     write_log("Downloads go to: " + out_dir.get())
     threading.Thread(target=startup, daemon=True).start()
-    root.bind("<Control-Return>", lambda e: start())
+    root.bind("<Control-Return>", lambda e: start() and None)
+    # Start size: links and progress + log at their natural height; the settings in the
+    # middle get what's left of the screen and scroll if that's not enough.
     root.update_idletasks()
     room = root.winfo_screenheight() - px(80)      # leave space for the taskbar and title bar
-    if root.winfo_reqheight() > room:                # small screens: shorter activity box
-        log.configure(height=3)
+    sash = int(panes.cget("sashwidth")) + 2 * int(panes.cget("sashpad"))
+    chrome = root.winfo_reqheight() - panes.winfo_reqheight()   # menu, banner, status bar, margins
+    links_h, run_h, mid_h = pane_links.winfo_reqheight(), pane_run.winfo_reqheight(), mid.winfo_reqheight()
+    mid_fit = max(px(60), min(mid_h, room - chrome - links_h - run_h - 2 * sash))
+    mid_canvas.configure(height=mid_fit)
+    panes.paneconfigure(pane_links, height=links_h)
+    panes.paneconfigure(pane_mid, height=mid_fit)
+    panes.paneconfigure(pane_run, height=run_h)
+    height = min(room, chrome + links_h + mid_fit + run_h + 2 * sash)
+    width = max(root.winfo_reqwidth(), px(560))
+    root.minsize(width, min(px(420), room))
+    root.geometry(f"{width}x{height}")
+    root.update_idletasks()
+    layout["default"] = (width, height, links_h, links_h + sash + mid_fit)
+    saved = settings.get("layout") if isinstance(settings.get("layout"), dict) else {}
+    try:
+        sw, sh = (int(v) for v in saved.get("size"))
+        y0, y1 = (int(v) for v in saved.get("sash"))
+        root.geometry(f"{max(width, min(sw, root.winfo_screenwidth()))}x{max(px(420), min(sh, room))}")
         root.update_idletasks()
-    root.minsize(max(root.winfo_reqwidth(), px(560)), min(root.winfo_reqheight(), room))
+        root.after(200, lambda: place_sashes(y0, y1))
+    except (TypeError, ValueError):
+        pass
     links.focus_set()
+    if "--check-followed" in sys.argv[1:]:           # started by the daily task
+        follow_state["auto_close"] = True
+        root.iconify()
+        root.after(2000, lambda: check_followed(auto=True))
+    elif load_settings().get("follow_on_start"):
+        root.after(4000, lambda: check_followed(auto=True))
+    root.after(60000, follow_timer)
     poll()
     root.mainloop()
 

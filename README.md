@@ -10,10 +10,11 @@
 </p>
 
 <p align="center">
-  A small Windows app that saves videos from YouTube and the 1,000+ other sites
-  <a href="https://github.com/yt-dlp/yt-dlp">yt-dlp</a> supports, and can upload them to
-  your own <a href="https://archive.org">archive.org</a> account with a proper title,
-  description, topics and thumbnail. No command line needed.
+  A small Windows app that keeps your favourite videos safe: it saves them from YouTube
+  and the 1,000+ other sites <a href="https://github.com/yt-dlp/yt-dlp">yt-dlp</a> supports,
+  follows channels so new videos arrive by themselves, and can upload to your own
+  <a href="https://archive.org">archive.org</a> account. Made with ASMR collections in
+  mind: original-quality audio, nothing re-encoded. No command line needed.
 </p>
 
 <h3 align="center">
@@ -28,6 +29,7 @@
 - [How it works](#how-it-works)
 - [Install](#install)
 - [Quick start](#quick-start)
+- [Follow your favourite channels](#follow-your-favourite-channels)
 - [Uploading to archive.org](#uploading-to-archiveorg)
 - [Handy tools](#handy-tools)
 - [Use it responsibly](#use-it-responsibly)
@@ -44,7 +46,12 @@
 ## Features
 
 **Downloading**
-- MP3 (music) or MP4 (video) up to 4K. MP4 prefers H.264, so it plays everywhere.
+- **Original quality:** the best video and audio exactly as the site has them (on YouTube
+  usually VP9/AV1 and Opus), nothing converted. Best for ASMR: whispers and binaural
+  sound stay as the creator uploaded them. Also as audio only (`.opus`/`.m4a`).
+- Or MP3 (music) / MP4 (video) up to 4K. MP4 prefers H.264, so it plays everywhere.
+- **Follow channels:** only new videos are fetched, each channel into its own folder;
+  check by hand, while the app is open, or once a day by itself.
 - Several links at once, whole playlists (asks first above 25 videos).
 - Any site yt-dlp supports. If a site's own support breaks, it automatically tries
   yt-dlp's generic page scanner.
@@ -55,8 +62,11 @@
 - Topics built from the video's tags, hashtags, category and keywords, plus your own.
 - Author, Creative Commons license and language fields.
 - Thumbnail and subtitles uploaded with the video.
-- Big files go up in parts: a Wi-Fi drop only re-sends one part, and a stopped
-  upload continues where it left off.
+- Downloads and uploads run side by side: the next video downloads while the last one uploads.
+- Big files go up in parts, 3 at a time: a Wi-Fi drop only re-sends one part, and a
+  stopped upload continues where it left off.
+- **Upload only:** untick **Keep a copy on this PC** and each video is deleted once it's
+  on archive.org. Videos already there aren't downloaded at all.
 - Waits when archive.org's upload queue is full instead of failing.
 - Explains refusals in plain words (keys, someone else's item, hidden item, account limit).
 
@@ -78,7 +88,7 @@ flowchart LR
     A[Paste links] --> B[yt-dlp finds the video]
     B --> C[FFmpeg makes MP3 or MP4]
     C --> D[Saved in your folder]
-    D -. optional .-> E[Uploaded to your<br/>archive.org account]
+    D -. optional, while the<br/>next video downloads .-> E[Uploaded to your<br/>archive.org account]
 ```
 
 Everything runs on your own PC. The app only talks to the video sites you use,
@@ -86,8 +96,28 @@ GitHub (for tool updates) and archive.org (only if you upload).
 
 ## Install
 
-**You need:** Windows 10 or 11 and an internet connection. Nothing else: the builder
-installs Python for you if it's missing.
+**You need:** Windows 10 or 11.
+
+1. Download **`Video-Archiver-<version>.exe`** from the [latest release](../../releases/latest).
+2. Double-click it and answer **Yes** to "Install Video Archiver on this PC?". It installs
+   for your Windows account only (no admin rights needed), adds desktop and Start menu
+   shortcuts, and starts. You can delete the downloaded file afterwards.
+
+**Update:** download the newest exe and run it; answer **Yes** to update. Your settings,
+followed channels and keys are kept.
+**Uninstall:** Windows **Settings > Apps**, or **Help > Uninstall** in the app.
+
+> [!NOTE]
+> Windows SmartScreen may say "Windows protected your PC", because the exe isn't signed
+> with a paid certificate. Click **More info > Run anyway**. The exe is built by GitHub
+> from the code in this repository (see the release's build log), and the release lists
+> its SHA-256 checksum. If you'd rather not trust a downloaded exe, build it yourself:
+
+<details>
+<summary><b>Build it yourself instead (the .bat builder)</b></summary>
+
+You need Windows 10 or 11 and an internet connection; the builder installs Python for
+you if it's missing.
 
 1. Download **`Build_Video_Archiver.bat`** from the
    [latest release](../../releases/latest).
@@ -99,23 +129,37 @@ installs Python for you if it's missing.
    - builds `Video Archiver.exe`, installs it and adds desktop and Start menu shortcuts.
 3. After 5–10 minutes the app opens. You can delete the `.bat` file.
 
-**Update:** download the newest `.bat` and run it again. Your settings are kept.
-**Uninstall:** Windows **Settings > Apps**, or **Help > Uninstall** in the app.
-
-> [!NOTE]
-> Windows SmartScreen or your antivirus may warn about the `.bat` or the built app.
-> The app is built on your own PC with PyInstaller, which some antivirus programs
-> distrust in general. You can read every line of the source in this repository.
+Some antivirus programs distrust apps built with PyInstaller in general and may warn.
+</details>
 
 ## Quick start
 
 1. **Step 1:** paste one or more links, one per line.
-2. **Step 2:** choose MP3 or MP4 and a quality.
+2. **Step 2:** choose MP3 or MP4 and a quality. For ASMR, tick **Original quality**.
 3. **Step 3:** choose the folder to save to.
 4. Press **Download** (or <kbd>Ctrl</kbd>+<kbd>Enter</kbd>).
 
-The activity log at the bottom shows what happens. Green means done, yellow is a
+The activity log at the bottom shows what happens. Drag the bars between the parts of the
+window to give it more room (or use **View > Make the activity log bigger**). Green means done, yellow is a
 note, red is an error with a plain explanation.
+
+## Follow your favourite channels
+
+1. Press **Channels…** next to Step 1 (or **Tools > Followed channels…**).
+2. Paste a channel link (for YouTube: `youtube.com/@name`), a playlist, or a profile on
+   another site, and press **Follow**.
+3. Choose whether to download the videos that are already there (**Yes**, oldest first)
+   or only new ones from now on (**No**).
+
+From then on, **Check all now** fetches only what's new, with your current Step 2–4
+settings, into a folder named after the channel. Under **Automatic checks** you can let
+it check when the app opens, every few hours while it's open, or **once a day while it's
+closed** (a Windows scheduled task starts the app minimized, fetches the new videos and
+closes it again).
+
+Live streams and premieres wait until they're finished. A video that fails (for example
+members-only) is tried again next time and left out after 3 tries, so it can't block
+the channel.
 
 ## Uploading to archive.org
 
@@ -126,6 +170,13 @@ note, red is an error with a plain explanation.
 4. Tick **Also upload every saved file to my archive.org account**.
 
 Each video becomes its own item at `archive.org/details/<your-prefix>-<video id>`.
+
+**Upload only, without keeping the videos:** untick **Keep a copy on this PC** in Step 4.
+Each video is downloaded into a hidden temporary folder, uploaded, then deleted. If an
+upload fails, the file is moved into your folder instead, so nothing is lost and
+**Upload files…** can finish it later. You still need room for about two videos at a
+time, because archive.org needs the whole finished file (its size and checksum) before
+it accepts it.
 
 > [!TIP]
 > Turn on **Options > archive.org trial mode** for your first uploads. They go to
@@ -146,6 +197,14 @@ Each video becomes its own item at `archive.org/details/<your-prefix>-<video id>
 ## Use it responsibly
 
 This tool downloads and re-publishes videos. **You are responsible for what you do with it.**
+
+**Keeping copies for yourself** of videos you love is what most people use it for, and
+the safest use. **Publishing them** on archive.org is different: the videos belong to
+their creators, and many creators (ASMR artists especially) depend on their views. Upload
+when the creator agrees, when the video is under a free license, or when it's your own.
+Asking is often enough; many creators are happy their work is preserved. archive.org
+removes uploads after a rights complaint, and repeated complaints can close your account,
+so this protects your archive too.
 
 - Only upload videos you have the right to share: your own, public-domain works, or
   videos under a license that allows it. archive.org removes items after rights
@@ -190,7 +249,9 @@ Try **Tools > Check a site or link**, then **Tools > yt-dlp channel > Nightly**,
 **Tools > Teach Video Archiver a new site**. If the site only creates the address
 while the video plays, press **Capture from a browser window** in that wizard (or use
 **Tools > Capture a video's stream address** for a single video). This also works on
-sites that refuse to play while DevTools are open.
+sites that refuse to play while DevTools are open, and on sites that disguise the
+video's address. The capture window shows the browser's traffic live; if it finds
+nothing, the activity log lists the biggest loads the browser made.
 
 DRM-protected video (the kind big paid streaming services use) can't be downloaded,
 and the app doesn't try to get around that.
@@ -199,8 +260,9 @@ and the app doesn't try to get around that.
 <details>
 <summary><b>Uploads are slow</b></summary>
 
-That's usually archive.org's servers. Big files are sent in parts, so you can
-stop and continue later with **Upload files…** without losing progress.
+That's usually archive.org's servers. Big files are sent in parts (3 at a time),
+so you can stop and continue later with **Upload files…** without losing progress.
+While one video uploads, the next one already downloads.
 </details>
 
 ## Privacy and where things are stored
@@ -211,6 +273,7 @@ stop and continue later with **Upload files…** without losing progress.
 | Settings, encrypted keys, built-in tools, upload progress | `%LOCALAPPDATA%\VideoArchiver` |
 | yt-dlp plugins (including ones the site wizard makes) | `%APPDATA%\yt-dlp\plugins` |
 | Downloads (default) | `Downloads\Video Archiver` |
+| Videos waiting for upload when **Keep a copy** is off | hidden `.yta-upload-cache` folder inside your download folder, emptied after each run |
 
 There's no telemetry and no account other than your own archive.org account.
 

@@ -1,6 +1,8 @@
 """Builds "Video Archiver.exe". Started by "Build Video Archiver.bat"; not meant to be run by hand.
 
-usage: build.py WORK_DIR
+usage: build.py WORK_DIR              build and install on this PC (what the .bat does)
+       build.py WORK_DIR --dist DIR   build only and put the exe plus notes in DIR
+                                      (GitHub's release workflow uses this)
 """
 
 import hashlib
@@ -44,8 +46,7 @@ NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 # The app source sits next to this script; install paths, the icon and the
 # shortcut helpers come from it, so installer and uninstaller always agree.
-from video_archiver import (APP_BLURB, APP_NAME, INSTALL_DIR, INSTALL_EXE, UNINSTALL_KEY,
-                     icon_ico, known_folder, make_shortcut, migrate_old_data, remove_old_install)
+from video_archiver import APP_NAME, APP_VERSION, INSTALL_EXE, icon_ico, install_app
 
 
 def say(msg=""):
@@ -172,6 +173,10 @@ obligations, e.g. offering the source) apply to that copy.
 
 def main():
     work = Path(sys.argv[1])
+    dist = Path(sys.argv[sys.argv.index("--dist") + 1]) if "--dist" in sys.argv[2:] else None
+    work.mkdir(parents=True, exist_ok=True)
+    if not (work / "video_archiver.py").exists():      # the release workflow runs this from src/
+        shutil.copy2(Path(__file__).with_name("video_archiver.py"), work / "video_archiver.py")
     tools, dl = work / "tools", work / "downloads"
     for d in (tools, dl):
         shutil.rmtree(d, ignore_errors=True)
@@ -228,65 +233,60 @@ def main():
     if r.returncode != 0 or not exe.exists():
         raise SystemExit("PyInstaller couldn't build the exe (see the messages above).")
 
-    install(exe)
+    if dist:
+        release_files(exe, dist, versions, sha256(work / "tools.tar.xz"))
+    else:
+        install(exe)
 
 
-def register_app(exe):
-    """List the app under Settings > Apps, with Uninstall pointing at the exe."""
-    import winreg
-    values = {"DisplayName": APP_NAME, "DisplayIcon": f"{exe},0",
-              "DisplayVersion": time.strftime("%Y.%m.%d"), "Publisher": "Personal build",
-              "Comments": APP_BLURB, "InstallLocation": str(exe.parent),
-              "UninstallString": f'"{exe}" --uninstall'}
-    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY) as key:
-        for name, value in values.items():
-            winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
-        for name, value in (("NoModify", 1), ("NoRepair", 1),
-                            ("EstimatedSize", max(1, exe.stat().st_size // 1024))):
-            winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, value)
+SOURCE_NOTE = """Video Archiver {version}: what's inside and where its source code is
+
+Video Archiver itself: MIT license. Source: this GitHub repository (tag v{version}).
+
+The exe also contains these programs, unchanged, exactly as their projects publish them:
+
+- yt-dlp {ytdlp} (Unlicense; the Windows build includes GPLv3+ parts)
+  Source: https://github.com/yt-dlp/yt-dlp/releases/tag/{ytdlp}
+  A copy of that source is attached to this release: yt-dlp-{ytdlp}-source.tar.gz
+
+- FFmpeg (GPL build by the yt-dlp project): {ffmpeg}
+  Source of exactly this version: https://github.com/FFmpeg/FFmpeg/tree/{ffcommit}
+  A copy is attached to this release: ffmpeg-{ffcommit}-source.tar.gz
+  How it was built (scripts and all included libraries): https://github.com/yt-dlp/FFmpeg-Builds
+
+- Deno {denov} (MIT): https://github.com/denoland/deno/releases/tag/{denov}
+
+- Python and PyInstaller's bootloader (PSF license; GPL with an exception that allows this use).
+
+License texts are also inside the app's data folder after the first start
+(%LOCALAPPDATA%\\VideoArchiver\\tools\\LICENSES.txt and the ffmpeg folder).
+"""
+
+
+def release_files(exe, dist, versions, tools_hash):
+    """The files for a GitHub release: the exe, a checksum and the source notes."""
+    dist.mkdir(parents=True, exist_ok=True)
+    out = dist / f"Video-Archiver-{APP_VERSION}.exe"
+    shutil.copy2(exe, out)
+    ff = versions["FFmpeg"]
+    m = re.search(r"-g([0-9a-f]{7,40})", ff)
+    note = SOURCE_NOTE.format(version=APP_VERSION, ytdlp=YTDLP_VERSION, ffmpeg=ff,
+                              ffcommit=m.group(1) if m else "master", deno=versions["Deno"],
+                              denov=DENO_VERSION)
+    (dist / "SOURCES-AND-LICENSES.txt").write_text(note, encoding="utf-8")
+    (dist / "SHA256SUMS.txt").write_text(f"{sha256(out)}  {out.name}\n", encoding="utf-8")
+    (dist / "ffmpeg-commit.txt").write_text(m.group(1) if m else "", encoding="utf-8")
+    say(f"      Release files in {dist}: {out.name} ({out.stat().st_size >> 20} MB)")
 
 
 def install(exe):
-    """Copy the exe to its own Programs folder and add shortcuts. Nothing of
-    other app is touched: own folder, file names and Apps entry."""
-    left = remove_old_install(say)
-    if left:
-        say("      Note: YT Archiver (the old name) is probably still open, so these stay. Close it")
-        say("      and delete them by hand: " + "; ".join(left))
-    note = migrate_old_data()
-    if note:
-        say("      " + note)
-    say(f"      Installing to {INSTALL_DIR}...")
+    """Install on this PC (the same steps a downloaded exe uses to install itself)."""
     try:
-        INSTALL_DIR.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(exe, INSTALL_EXE)
+        install_app(exe, say)
     except OSError:
         raise SystemExit(f"Couldn't write {INSTALL_EXE}. Close {APP_NAME} and run the builder again.")
-    say(f"      Size: {INSTALL_EXE.stat().st_size >> 20} MB")
     if sys.platform != "win32":
         return
-
-    desktop = known_folder("Desktop", Path.home() / "Desktop")
-    old = desktop / f"{APP_NAME}.exe"   # the earlier version put a bare exe on the desktop
-    if old.is_file():
-        try:
-            old.unlink()
-            say(f"      Removed the old {old.name} from the desktop (replaced by a shortcut).")
-        except OSError:
-            say(f"      Note: couldn't remove the old {old.name} from the desktop. Close it "
-                "and delete it by hand; the shortcut replaces it.")
-
-    for lnk in (desktop / f"{APP_NAME}.lnk",
-                known_folder("Programs", Path.home()) / f"{APP_NAME}.lnk"):
-        if make_shortcut(lnk, INSTALL_EXE):
-            say(f"      Shortcut: {lnk}")
-        else:
-            say(f"      Note: couldn't create the shortcut {lnk}")
-    try:
-        register_app(INSTALL_EXE)
-        say("      Listed under Settings > Apps (uninstall from there or from Help).")
-    except OSError:
-        say("      Note: couldn't add the Settings > Apps entry. Help > Uninstall still works.")
     say("      Note: FFmpeg is GPL and the yt-dlp program includes GPLv3+ parts. If you give")
     say("      this exe to others, those licenses apply; see tools\\LICENSES.txt after first start.")
     os.startfile(INSTALL_EXE)
